@@ -65,6 +65,8 @@ client_gnutls_init (struct client *c)
   gnutls_certificate_set_x509_system_trust (c->cred);
   gnutls_init (&c->session, GNUTLS_CLIENT | GNUTLS_ENABLE_EARLY_DATA
                | GNUTLS_NO_END_OF_EARLY_DATA);
+// 这个和quic-echo中的 setup_gnutls_for_quic函数应该是相同的作用
+// 用在server的也有，函数名不一样
   ngtcp2_crypto_gnutls_configure_client_session (c->session);
 
   gnutls_priority_set_direct (c->session, priority, NULL);

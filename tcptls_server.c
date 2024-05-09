@@ -50,9 +50,12 @@ main ()
 
   printf ("Server listening on port %d...\n", SERVER_PORT);
 
-  const char *ca_crt = "../Documents/ca.crt";
-  const char *server_crt = "../Documents/server.crt";
-  const char *server_key = "../Documents/server.key";
+  // const char *ca_crt = "../Documents/ca.crt";
+  // const char *server_crt = "../Documents/server.crt";
+  // const char *server_key = "../Documents/server.key";
+  const char *ca_crt = "credentials/ca.pem";
+  const char *server_crt = "credentials/server.pem";
+  const char *server_key = "credentials/server-key.pem";
   gnutls_certificate_credentials_t x509_cred;
   gnutls_priority_t priority_cache;
   gnutls_session_t session;

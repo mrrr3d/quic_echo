@@ -38,7 +38,7 @@ int main() {
 
     gnutls_session_t session;
     gnutls_certificate_credentials_t xcred;
-    const char *ca_crt = "../Documents/ca.crt";
+    const char *ca_crt = "credentials/ca.pem";
     gnutls_global_init();
     gnutls_certificate_allocate_credentials(&xcred);
     // gnutls_certificate_set_x509_trust_file(xcred, ca_crt, GNUTLS_X509_FMT_PEM);
