@@ -117,6 +117,15 @@ recv_pkt (int fd, uint8_t *data, size_t datalen,
   return ret;
 }
 
+void
+dispcid (const uint8_t *cid, size_t cidlen) {
+  int i;
+  for (i = 0;i < cidlen;i ++) {
+    printf ("%x", cid[i]);
+  }
+  printf ("\n");
+}
+
 
 struct connection*
 find_connection (struct server *s, const uint8_t *dcid, size_t dcidlen)
@@ -130,7 +139,7 @@ find_connection (struct server *s, const uint8_t *dcid, size_t dcidlen)
     size_t num_scids = ngtcp2_conn_get_scid (conn, NULL);
 
     ngtcp2_cid scids[8];
-    ngtcp2_conn_get_scid (conn, &(scids[0]));
+    ngtcp2_conn_get_scid (conn, scids);
     int j;
     for (j = 0; j < num_scids; j++)
     {
@@ -196,6 +205,20 @@ get_new_connection_id_cb (ngtcp2_conn *conn, ngtcp2_cid *cid,
   return 0;
 }
 
+int
+recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
+                     uint64_t offset, const uint8_t *data, size_t datalen,
+                     void *user_data,
+                     void *stream_user_data)
+{
+  
+  char buf[256] = "recv_data:";
+  memcpy(buf + 10, data, datalen);
+  buf[10 + datalen] = 0;
+  write (1, buf, 10 + datalen);
+
+  return 0;
+}
 
 ngtcp2_callbacks callbacks = {
   // .client_initial
@@ -216,6 +239,7 @@ ngtcp2_callbacks callbacks = {
   // .stream_open = stream_open_cb,
   .rand = rand_cb,
   .get_new_connection_id = get_new_connection_id_cb,
+  .recv_stream_data = recv_stream_data_cb,
 };
 
 ngtcp2_conn*
@@ -305,6 +329,7 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
   gnutls_session_set_ptr (new_connection->session, &new_connection->conn_ref);
   new_connection->conn_ref.get_conn = get_conn;
   new_connection->conn_ref.user_data = new_connection;
+  new_connection->stream.stream_id = -1;
 
   return new_connection;
 }
@@ -334,7 +359,7 @@ handle_incoming (struct server *s)
 
     ngtcp2_version_cid version_cid;
 
-    ret = ngtcp2_pkt_decode_version_cid (&version_cid, buf, n_read, 18);
+    ret = ngtcp2_pkt_decode_version_cid (&version_cid, buf, n_read, 20);
     if (ret < 0)
     {
       fprintf (stderr, "ngtcp2_pkt_decode_version_cid error!\n");
@@ -355,7 +380,8 @@ handle_incoming (struct server *s)
         return -1;
       }
       ev_io_init (&connection->wev, write_cb, connection->fd, EV_WRITE);
-      ev_io_start (EV_DEFAULT, &connection->wev);
+      connection->wev.data = s;
+      // ev_io_start (EV_DEFAULT, &connection->wev);
       // timer 暂时没弄
     }
 
@@ -381,7 +407,10 @@ handle_incoming (struct server *s)
 
 
 int
-server_send_pkt (struct connection *connection, uint8_t *data, size_t datalen)
+server_send_pkt (struct connection *connection,
+                 uint8_t *data, size_t datalen,
+                 struct sockaddr *remote_addr,
+                 socklen_t remotea_addrlen)
 {
   struct iovec iov = {data, datalen};
   struct msghdr msg = {0};
@@ -389,6 +418,8 @@ server_send_pkt (struct connection *connection, uint8_t *data, size_t datalen)
 
   msg.msg_iov = &iov;
   msg.msg_iovlen = 1;
+  msg.msg_name = remote_addr;
+  msg.msg_namelen = remotea_addrlen;
   do {
     nwrite = sendmsg (connection->fd, &msg, 0);
   } while (nwrite == -1 && errno == EINTR);
@@ -471,7 +502,9 @@ write_to_stream (struct connection *connection)
     {
       connection->stream.nwrite += (size_t) wdatalen;
     }
-    if (server_send_pkt (connection, buf, (size_t) nwrite) != 0)
+    if (0 != server_send_pkt (connection, buf, (size_t) nwrite,
+                              &connection->client_addr,
+                              connection->client_addrlen))
       break;
   }
   return 0;
@@ -526,7 +559,8 @@ connection_close (struct connection *connection)
     goto fin;
   }
 
-  server_send_pkt (connection, buf, (size_t) nwrite);
+  server_send_pkt (connection, buf, (size_t) nwrite,
+                   &connection->client_addr, connection->client_addrlen);
 fin:
   ev_break (EV_DEFAULT, EVBREAK_ALL);
 }
@@ -538,7 +572,14 @@ read_cb (struct ev_loop *loop, ev_io *w, int revents)
   struct server *s = w->data;
   int ret;
   ret = handle_incoming (s);
-  printf ("read_cb:handle_incoming:ret = %d\n", ret);
+  struct connection *connection;
+  int i;
+
+  for (i = 0; i < s->num_connections; i++)
+  {
+    connection = &(s->connections[i]);
+    ret = connection_write (connection);
+  }
 }
 
 
@@ -548,10 +589,11 @@ write_cb (struct ev_loop *loop, ev_io *w, int revents)
   struct server *s = w->data;
   struct connection *connection;
   int i;
+  int ret;
   for (i = 0; i < s->num_connections; i++)
   {
     connection = &(s->connections[i]);
-    connection_write (connection);
+    ret = connection_write (connection);
   }
 }
 
