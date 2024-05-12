@@ -74,7 +74,7 @@ client_gnutls_init (struct client *c)
   gnutls_credentials_set (c->session, GNUTLS_CRD_CERTIFICATE, c->cred);
 
   gnutls_server_name_set (c->session, GNUTLS_NAME_DNS,
-                          "127.0.0.1", strlen ("127.0.0.1"));
+                          "localhost", strlen ("localhost"));
   return 0;
 }
 

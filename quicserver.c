@@ -16,6 +16,7 @@
 #define LOCAL_HOST "127.0.0.1"
 #define LOCAL_PORT "5556"
 
+struct server;
 struct connection
 {
   ngtcp2_conn *conn;
@@ -26,8 +27,11 @@ struct connection
   socklen_t local_addrlen;
   int fd;
   ev_io wev;
+  ev_timer timer;
   ngtcp2_ccerr last_error;
   ngtcp2_crypto_conn_ref conn_ref;
+  struct server *server;
+  struct connection *next;
 
   struct
   {
@@ -45,7 +49,7 @@ struct server
   socklen_t local_addrlen;
   gnutls_certificate_credentials_t cred;
   int fd;
-  struct connection connections[10];
+  struct connection *connections;
   uint8_t num_connections;
   ngtcp2_settings settings;
   ev_io rev;
@@ -117,10 +121,13 @@ recv_pkt (int fd, uint8_t *data, size_t datalen,
   return ret;
 }
 
+
 void
-dispcid (const uint8_t *cid, size_t cidlen) {
+dispcid (const uint8_t *cid, size_t cidlen)
+{
   int i;
-  for (i = 0;i < cidlen;i ++) {
+  for (i = 0; i < cidlen; i++)
+  {
     printf ("%x", cid[i]);
   }
   printf ("\n");
@@ -130,18 +137,17 @@ dispcid (const uint8_t *cid, size_t cidlen) {
 struct connection*
 find_connection (struct server *s, const uint8_t *dcid, size_t dcidlen)
 {
-  struct connection *connection = NULL;
-  int i;
-  for (i = 0; i < s->num_connections; i++)
+  struct connection *connection = s->connections;
+  while (NULL != connection)
   {
-    connection = &s->connections[i];
     ngtcp2_conn *conn = connection->conn;
     size_t num_scids = ngtcp2_conn_get_scid (conn, NULL);
-
-    ngtcp2_cid scids[8];
-    ngtcp2_conn_get_scid (conn, scids);
+    ngtcp2_cid scids[9];
+    memcpy (&scids[0], ngtcp2_conn_get_client_initial_dcid (conn),
+            sizeof (ngtcp2_cid));
+    ngtcp2_conn_get_scid (conn, scids + 1);
     int j;
-    for (j = 0; j < num_scids; j++)
+    for (j = 0; j < num_scids + 1; j++)
     {
       if (scids[j].datalen == dcidlen &&
           0 == memcmp (scids[j].data, dcid, dcidlen))
@@ -149,6 +155,7 @@ find_connection (struct server *s, const uint8_t *dcid, size_t dcidlen)
         return connection;
       }
     }
+    connection = connection->next;
   }
 
   return NULL;
@@ -205,20 +212,32 @@ get_new_connection_id_cb (ngtcp2_conn *conn, ngtcp2_cid *cid,
   return 0;
 }
 
+
+int
+remove_connection_id (ngtcp2_conn *conn, const ngtcp2_cid *cid,
+                      void *user_data)
+{
+  printf ("======remove_connection_cb:");
+  dispcid (cid->data, cid->datalen);
+  return 0;
+}
+
+
 int
 recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                      uint64_t offset, const uint8_t *data, size_t datalen,
                      void *user_data,
                      void *stream_user_data)
 {
-  
+
   char buf[256] = "recv_data:";
-  memcpy(buf + 10, data, datalen);
+  memcpy (buf + 10, data, datalen);
   buf[10 + datalen] = 0;
   write (1, buf, 10 + datalen);
 
   return 0;
 }
+
 
 ngtcp2_callbacks callbacks = {
   // .client_initial
@@ -240,6 +259,7 @@ ngtcp2_callbacks callbacks = {
   .rand = rand_cb,
   .get_new_connection_id = get_new_connection_id_cb,
   .recv_stream_data = recv_stream_data_cb,
+  .remove_connection_id = remove_connection_id,
 };
 
 ngtcp2_conn*
@@ -259,20 +279,22 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
                    socklen_t remote_addrlen, uint8_t *data,
                    size_t datalen)
 {
-  if (10 == s->num_connections)
-  {
-    return NULL;
-  }
   ngtcp2_pkt_hd header;
   int ret;
 
-  struct connection *new_connection = &s->connections[s->num_connections];
-  s->num_connections += 1;
   ret = ngtcp2_accept (&header, data, datalen);
   if (ret < 0)
   {
+    printf ("ngtcp2_accept error ret = %d %s\n", ret, ngtcp2_strerror (ret));
     return NULL;
   }
+  struct connection *new_connection;
+  new_connection = (struct connection*) malloc (sizeof (struct connection));
+  memset (new_connection, 0, sizeof(new_connection));
+  new_connection->next = s->connections;
+  s->connections = new_connection;
+
+  s->num_connections += 1;
   gnutls_init (&new_connection->session, GNUTLS_SERVER
                | GNUTLS_ENABLE_EARLY_DATA
                | GNUTLS_NO_END_OF_EARLY_DATA);
@@ -301,6 +323,7 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
   params.initial_max_stream_data_bidi_remote = 128 * 1024;
   params.initial_max_data = 1024 * 1024;
   params.original_dcid_present = 1;
+  params.max_idle_timeout = 5 * NGTCP2_SECONDS;
   memcpy (&params.original_dcid, &header.dcid,
           sizeof (params.original_dcid));
   ngtcp2_cid scid;
@@ -330,8 +353,74 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
   new_connection->conn_ref.get_conn = get_conn;
   new_connection->conn_ref.user_data = new_connection;
   new_connection->stream.stream_id = -1;
+  new_connection->server = s;
 
   return new_connection;
+}
+
+
+void
+connection_close (struct connection *connection);
+
+int
+connection_write (struct connection *connection);
+
+
+void
+server_remove_connection (struct connection *connection)
+{
+  struct server *s = connection->server;
+  struct connection *curr = s->connections;
+  if (NULL == s->connections)
+    return;
+  s->num_connections -= 1;
+  if (connection == s->connections)
+  {
+    s->connections = connection->next;
+    ev_timer_stop (EV_DEFAULT, &connection->timer);
+    ev_io_stop (EV_DEFAULT, &connection->wev);
+    free (connection);
+    return;
+  }
+
+  while (NULL != curr->next &&
+         curr->next != connection)
+  {
+    curr = curr->next;
+  }
+  if (curr->next == connection)
+  {
+    curr->next = connection->next;
+    ev_timer_stop (EV_DEFAULT, &connection->timer);
+    ev_io_stop (EV_DEFAULT, &connection->wev);
+    free (connection);
+  }
+
+  return;
+}
+
+
+void
+timer_cb (struct ev_loop *loop, ev_timer *w, int revents)
+{
+
+  printf ("=====in timer_cb\n");
+  struct connection *c = w->data;
+
+  int ret = ngtcp2_conn_handle_expiry (c->conn, timestamp ());
+  if (ret != 0)
+  {
+    printf ("ngtcp2_conn_handle_expiry ret = %s\n", ngtcp2_strerror (ret));
+    // connection_close (c);
+    server_remove_connection (c);
+    return;
+  }
+  if (connection_write (c) != 0)
+  {
+    // fprintf (stdout, "client_write!=0\n");
+    // connection_close (c);
+    server_remove_connection (c);
+  }
 }
 
 
@@ -381,8 +470,9 @@ handle_incoming (struct server *s)
       }
       ev_io_init (&connection->wev, write_cb, connection->fd, EV_WRITE);
       connection->wev.data = s;
+      ev_timer_init (&connection->timer, timer_cb, 0., 0.);
+      connection->timer.data = connection;
       // ev_io_start (EV_DEFAULT, &connection->wev);
-      // timer 暂时没弄
     }
 
     ngtcp2_conn *conn = connection->conn;
@@ -514,6 +604,7 @@ write_to_stream (struct connection *connection)
 int
 connection_write (struct connection *connection)
 {
+  printf ("in connection_write!\n");
   ngtcp2_tstamp expiry, now;
   ev_tstamp t;
   if (0 != write_to_stream (connection))
@@ -526,8 +617,8 @@ connection_write (struct connection *connection)
   t = expiry < now ? 1e-9 : (ev_tstamp) (expiry - now) / NGTCP2_SECONDS;
 
   // printf("t=%lf\n", t);
-  // c->timer.repeat = t;
-  // ev_timer_again (EV_DEFAULT, &c->timer);
+  connection->timer.repeat = t;
+  ev_timer_again (EV_DEFAULT, &connection->timer);
 
   return 0;
 }
@@ -536,6 +627,7 @@ connection_write (struct connection *connection)
 void
 connection_close (struct connection *connection)
 {
+  printf ("in connection_close!\n");
   ngtcp2_ssize nwrite;
   ngtcp2_pkt_info pi;
   ngtcp2_path_storage ps;
@@ -562,7 +654,7 @@ connection_close (struct connection *connection)
   server_send_pkt (connection, buf, (size_t) nwrite,
                    &connection->client_addr, connection->client_addrlen);
 fin:
-  ev_break (EV_DEFAULT, EVBREAK_ALL);
+  // ev_break (EV_DEFAULT, EVBREAK_ALL);
 }
 
 
@@ -571,14 +663,20 @@ read_cb (struct ev_loop *loop, ev_io *w, int revents)
 {
   struct server *s = w->data;
   int ret;
+  printf ("num_connections = %d\n", s->num_connections);
   ret = handle_incoming (s);
+  if (0 != ret)
+  {
+    printf ("handle_incoming error!\n");
+    return;
+  }
   struct connection *connection;
   int i;
-
-  for (i = 0; i < s->num_connections; i++)
+  connection = s->connections;
+  while (NULL != connection)
   {
-    connection = &(s->connections[i]);
     ret = connection_write (connection);
+    connection = connection->next;
   }
 }
 
@@ -588,12 +686,12 @@ write_cb (struct ev_loop *loop, ev_io *w, int revents)
 {
   struct server *s = w->data;
   struct connection *connection;
-  int i;
   int ret;
-  for (i = 0; i < s->num_connections; i++)
+  connection = s->connections;
+  while (NULL != connection)
   {
-    connection = &(s->connections[i]);
     ret = connection_write (connection);
+    connection = connection->next;
   }
 }
 
@@ -659,11 +757,15 @@ void
 server_free (struct server *s)
 {
   gnutls_certificate_free_credentials (s->cred);
-  int i;
-  for (i = 0; i < s->num_connections; i++)
+  struct connection *tmp, *curr;
+  curr = s->connections;
+  while (NULL != curr)
   {
-    connection_free (&(s->connections[i]));
+    tmp = curr;
+    curr = curr->next;
+    free (curr);
   }
+  s->num_connections = 0;
 }
 
 
