@@ -8,6 +8,7 @@
     "types.h": "c",
     "*.tcc": "c",
     "ngtcp2_crypto.h": "c",
-    "ngtcp2_crypto_gnutls.h": "c"
+    "ngtcp2_crypto_gnutls.h": "c",
+    "ev.h": "c"
   }
 }
