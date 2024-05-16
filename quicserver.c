@@ -222,6 +222,9 @@ remove_connection_id (ngtcp2_conn *conn, const ngtcp2_cid *cid,
   return 0;
 }
 
+int
+connection_write (struct connection *connection);
+
 
 int
 recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
@@ -229,12 +232,20 @@ recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                      void *user_data,
                      void *stream_user_data)
 {
-
+  struct connection *c = (struct connection*) user_data;
   char buf[256] = "recv_data:";
   memcpy (buf + 10, data, datalen);
   buf[10 + datalen] = 0;
   write (1, buf, 10 + datalen);
 
+  memcpy (buf, data, datalen);
+  char suffix[] = "-----server_side\n";
+  memcpy (buf + datalen, suffix, sizeof (suffix));
+  c->stream.data = buf;
+  c->stream.datalen = datalen + sizeof (suffix);
+  c->stream.stream_id = stream_id;
+  c->stream.nwrite = 0;
+  connection_write (c);
   return 0;
 }
 
@@ -323,7 +334,7 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
   params.initial_max_stream_data_bidi_remote = 128 * 1024;
   params.initial_max_data = 1024 * 1024;
   params.original_dcid_present = 1;
-  params.max_idle_timeout = 5 * NGTCP2_SECONDS;
+  params.max_idle_timeout = 30 * NGTCP2_SECONDS;
   memcpy (&params.original_dcid, &header.dcid,
           sizeof (params.original_dcid));
   ngtcp2_cid scid;
@@ -362,8 +373,6 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
 void
 connection_close (struct connection *connection);
 
-int
-connection_write (struct connection *connection);
 
 
 void
