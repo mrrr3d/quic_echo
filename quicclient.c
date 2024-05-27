@@ -29,6 +29,21 @@ timestamp (void)
 }
 
 
+struct Stream
+{
+
+  int64_t stream_id;
+
+  uint8_t *data;
+  uint64_t datalen;
+
+  uint32_t sent_offset;
+  uint32_t ack_offset;
+
+  struct Stream *next;
+};
+
+
 struct client
 {
   gnutls_session_t session;
@@ -38,13 +53,7 @@ struct client
   socklen_t client_addrlen;
   ngtcp2_crypto_conn_ref conn_ref;
   ngtcp2_conn *conn;
-  struct
-  {
-    int64_t stream_id;
-    const uint8_t *data;
-    size_t datalen;
-    size_t nwrite;
-  } stream;
+  struct Stream *streams;
 
   ngtcp2_ccerr last_error;
   ev_timer timer;
@@ -116,8 +125,36 @@ get_new_connection_id_cb (ngtcp2_conn *conn, ngtcp2_cid *cid,
 
 void
 client_close (struct client *c);
+
 int
 client_write (struct client *c);
+
+struct Stream*
+create_stream (struct client *c, int64_t id)
+{
+  struct Stream *new_stream = NULL;
+  new_stream = (struct Stream*) malloc (sizeof (struct Stream));
+  memset (new_stream, 0, sizeof (struct Stream));
+  new_stream->stream_id = id;
+  new_stream->next = c->streams;
+  c->streams = new_stream;
+  return new_stream;
+}
+
+
+void
+stream_free (struct client *c)
+{
+  struct Stream *tmp, *curr;
+  curr = c->streams;
+  while (NULL != curr)
+  {
+    tmp = curr;
+    curr = curr->next;
+    free (curr);
+  }
+}
+
 
 void
 stdin_cb (struct ev_loop *loop, ev_io *w, int revents)
@@ -127,20 +164,25 @@ stdin_cb (struct ev_loop *loop, ev_io *w, int revents)
   struct client *c = w->data;
   char buf[1024];
   ssize_t nread = 0;
+  struct Stream *stream;
 
+  stream = create_stream (c, -1);
   nread = read (0, buf, sizeof(buf));
 
+  ngtcp2_conn_open_bidi_stream (c->conn, &stream->stream_id, NULL);
+  stream->data = buf;
+  stream->datalen = nread;
 
-  if (c->stream.stream_id == -1)
-  {
-    int64_t stream_id;
-    ngtcp2_conn_open_bidi_stream (c->conn, &stream_id, NULL);
-    c->stream.stream_id = stream_id;
-  }
+  // if (c->stream.stream_id == -1)
+  // {
+  //   int64_t stream_id;
+  //   ngtcp2_conn_open_bidi_stream (c->conn, &stream_id, NULL);
+  //   c->stream.stream_id = stream_id;
+  // }
 
-  c->stream.data = buf;
-  c->stream.datalen = nread;
-  c->stream.nwrite = 0;
+  // c->stream.data = buf;
+  // c->stream.datalen = nread;
+  // c->stream.nwrite = 0;
   client_write (c);
 
   return;
@@ -165,12 +207,60 @@ recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                      void *user_data,
                      void *stream_user_data)
 {
-  
+
+  ngtcp2_conn_extend_max_stream_offset (conn, stream_id, datalen);
+  ngtcp2_conn_extend_max_offset (conn, datalen);
   char buf[256] = "recv_data:";
-  memcpy(buf + 10, data, datalen);
+  memcpy (buf + 10, data, datalen);
   buf[10 + datalen] = 0;
   write (1, buf, 10 + datalen);
 
+  return 0;
+}
+
+
+void
+connection_remove_stream (struct client *c, int64_t stream_id)
+{
+  struct Stream *curr = c->streams;
+  struct Stream *tmp;
+  if (NULL == curr)
+    return;
+  if (curr->stream_id == stream_id)
+  {
+    c->streams = curr->next;
+    free (curr);
+    return;
+  }
+  while (NULL != curr)
+  {
+    if (curr->stream_id == stream_id)
+    {
+      tmp->next = curr->next;
+      free (curr);
+      return;
+    }
+    tmp = curr;
+    curr = curr->next;
+  }
+}
+
+
+int
+stream_close_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
+                 uint64_t app_error_code, void *user_data,
+                 void *stream_user_data)
+{
+  printf ("stream_close id = %ld\n", stream_id);
+  struct client *c = user_data;
+  connection_remove_stream (c, stream_id);
+  int i = 0;
+  struct Stream *s;
+  for (s = c->streams;s;s = s->next)
+  {
+    i += 1;
+  }
+  printf ("streams cnt = %d\n", i);
   return 0;
 }
 
@@ -217,6 +307,7 @@ client_quic_init (struct client *c, struct sockaddr *client_addr,
     .rand = rand_cb,
     .get_new_connection_id = get_new_connection_id_cb,
     .handshake_completed = handshake_completed_cb,
+    .stream_close = stream_close_cb,
     // .extend_max_local_streams_bidi = extend_max_local_streams_bidi,
   };
 
@@ -337,7 +428,7 @@ client_read (struct client *c)
 
 
 int
-client_write_streams (struct client *c)
+client_write_streams (struct client *c, struct Stream *stream)
 {
   uint8_t buf[1280];
   ngtcp2_tstamp ts = timestamp ();
@@ -355,13 +446,13 @@ client_write_streams (struct client *c)
 
   for (;;)
   {
-    if (c->stream.stream_id != -1 &&
-        c->stream.nwrite < c->stream.datalen)
+    if (NULL != stream &&
+        stream->sent_offset < stream->datalen)
     {
-      stream_id = c->stream.stream_id;
-      fin = 0;
-      datav.base = (uint8_t *) c->stream.data + c->stream.nwrite;
-      datav.len = c->stream.datalen - c->stream.nwrite;
+      stream_id = stream->stream_id;
+      fin = 1;
+      datav.base = (uint8_t *) stream->data + stream->sent_offset;
+      datav.len = stream->datalen - stream->sent_offset;
       datavcnt = 1;
     }
     else
@@ -372,11 +463,32 @@ client_write_streams (struct client *c)
       datav.len = 0;
       datavcnt = 0;
     }
+    // if (c->stream.stream_id != -1 &&
+    //     c->stream.nwrite < c->stream.datalen)
+    // {
+    //   stream_id = c->stream.stream_id;
+    //   fin = 0;
+    //   datav.base = (uint8_t *) c->stream.data + c->stream.nwrite;
+    //   datav.len = c->stream.datalen - c->stream.nwrite;
+    //   datavcnt = 1;
+    // }
+    // else
+    // {
+    //   stream_id = -1;
+    //   fin = 0;
+    //   datav.base = NULL;
+    //   datav.len = 0;
+    //   datavcnt = 0;
+    // }
 
     flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
     if (fin)
       flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
 
+    printf ("data_left: %lu\n",
+            ngtcp2_conn_get_max_stream_data_left (c->conn, stream_id));
+    printf ("stream_bidi_left: %lu\n",
+            ngtcp2_conn_get_streams_bidi_left (c->conn));
     nwrite = ngtcp2_conn_writev_stream (c->conn, &ps.path, &pi, buf,
                                         sizeof(buf),
                                         &wdatalen, flags, stream_id, &datav,
@@ -387,7 +499,8 @@ client_write_streams (struct client *c)
       switch (nwrite)
       {
       case NGTCP2_ERR_WRITE_MORE:
-        c->stream.nwrite += (size_t) wdatalen;
+        // c->stream.nwrite += (size_t) wdatalen;
+        stream->sent_offset += (size_t) wdatalen;
         continue;
       default:
         fprintf (stderr, "ngtcp2_conn_writev_stream: %s\n",
@@ -402,7 +515,8 @@ client_write_streams (struct client *c)
     }
     if (wdatalen > 0)
     {
-      c->stream.nwrite += (size_t) wdatalen;
+      // c->stream.nwrite += (size_t) wdatalen;
+      stream->sent_offset += (size_t) wdatalen;
     }
     if (client_send_pkt (c, buf, (size_t) nwrite) != 0)
       break;
@@ -417,10 +531,28 @@ client_write (struct client *c)
   // printf("client_write!\n");
   ngtcp2_tstamp expiry, now;
   ev_tstamp t;
-  if (client_write_streams (c) != 0)
+  int rv;
+  struct Stream *stream = c->streams;
+  if (NULL == stream)
   {
-    return -1;
+    rv = client_write_streams (c, NULL);
+    if (0 != rv)
+    {
+      return -1;
+    }
   }
+  for (; stream; stream = stream->next)
+  {
+    rv = client_write_streams (c, stream);
+    if (0 != rv)
+    {
+      return -1;
+    }
+  }
+  // if (client_write_streams (c) != 0)
+  // {
+  //   return -1;
+  // }
   expiry = ngtcp2_conn_get_expiry (c->conn);
   now = timestamp ();
 
@@ -541,7 +673,8 @@ client_init (struct client *c)
                           (struct sockaddr*) &server_addr, sizeof(server_addr));
   // printf ("client_quic_init:ret=%d\n", ret);
 
-  c->stream.stream_id = -1;
+  // c->stream.stream_id = -1;
+  c->streams = NULL;
 
   c->conn_ref.user_data = c;
   c->conn_ref.get_conn = get_conn;
@@ -562,6 +695,7 @@ client_init (struct client *c)
 void
 client_free (struct client *c)
 {
+  stream_free (c);
   ngtcp2_conn_del (c->conn);
   gnutls_deinit (c->session);
   gnutls_certificate_free_credentials (c->cred);

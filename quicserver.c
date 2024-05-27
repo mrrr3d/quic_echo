@@ -17,6 +17,21 @@
 #define LOCAL_PORT "5556"
 
 struct server;
+
+struct Stream
+{
+
+  int64_t stream_id;
+
+  uint8_t *data;
+  uint64_t datalen;
+
+  uint32_t sent_offset;
+  uint32_t ack_offset;
+
+  struct Stream *next;
+};
+
 struct connection
 {
   ngtcp2_conn *conn;
@@ -33,14 +48,7 @@ struct connection
   struct server *server;
   struct connection *next;
 
-  struct
-  {
-    int64_t stream_id;
-    const uint8_t *data;
-    size_t datalen;
-    size_t nwrite;
-  } stream;
-
+  struct Stream *streams;
 };
 
 struct server
@@ -92,6 +100,33 @@ server_gnutls_init (struct server *s)
                                         "credentials/server-key.pem",
                                         GNUTLS_X509_FMT_PEM);
 
+}
+
+
+struct Stream*
+create_stream (struct connection *c, int64_t id)
+{
+  struct Stream *new_stream = NULL;
+  new_stream = (struct Stream*) malloc (sizeof (struct Stream));
+  memset (new_stream, 0, sizeof (struct Stream));
+  new_stream->stream_id = id;
+  new_stream->next = c->streams;
+  c->streams = new_stream;
+  return new_stream;
+}
+
+
+void
+stream_free (struct connection *c)
+{
+  struct Stream *tmp, *curr;
+  curr = c->streams;
+  while (NULL != curr)
+  {
+    tmp = curr;
+    curr = curr->next;
+    free (curr);
+  }
 }
 
 
@@ -222,6 +257,7 @@ remove_connection_id (ngtcp2_conn *conn, const ngtcp2_cid *cid,
   return 0;
 }
 
+
 int
 connection_write (struct connection *connection);
 
@@ -233,6 +269,9 @@ recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                      void *stream_user_data)
 {
   struct connection *c = (struct connection*) user_data;
+  struct Stream *stream;
+  ngtcp2_conn_extend_max_stream_offset (conn, stream_id, datalen);
+  ngtcp2_conn_extend_max_offset (conn, datalen);
   char buf[256] = "recv_data:";
   memcpy (buf + 10, data, datalen);
   buf[10 + datalen] = 0;
@@ -241,11 +280,58 @@ recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   memcpy (buf, data, datalen);
   char suffix[] = "-----server_side\n";
   memcpy (buf + datalen, suffix, sizeof (suffix));
-  c->stream.data = buf;
-  c->stream.datalen = datalen + sizeof (suffix);
-  c->stream.stream_id = stream_id;
-  c->stream.nwrite = 0;
+  stream = create_stream (c, stream_id);
+  stream->data = buf;
+  stream->datalen = datalen + sizeof (suffix);
+  stream->sent_offset = 0;
+  // c->stream.data = buf;
+  // c->stream.datalen = datalen + sizeof (suffix);
+  // c->stream.stream_id = stream_id;
+  // c->stream.nwrite = 0;
   connection_write (c);
+  return 0;
+}
+
+
+void
+connection_remove_stream (struct connection *c, int64_t stream_id)
+{
+  struct Stream *curr = c->streams;
+  struct Stream *tmp;
+  if (NULL == curr)
+    return;
+  if (curr->stream_id == stream_id)
+  {
+    c->streams = curr->next;
+    free (curr);
+    return;
+  }
+  while (NULL != curr)
+  {
+    if (curr->stream_id == stream_id)
+    {
+      tmp->next = curr->next;
+      free (curr);
+      return;
+    }
+    tmp = curr;
+    curr = curr->next;
+  }
+}
+
+
+int
+stream_close_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
+                 uint64_t app_error_code, void *user_data,
+                 void *stream_user_data)
+{
+  printf ("stream_close id = %ld\n", stream_id);
+  struct connection *c = user_data;
+  connection_remove_stream (c, stream_id);
+  if (ngtcp2_is_bidi_stream (stream_id))
+  {
+    ngtcp2_conn_extend_max_streams_bidi (conn, 1);
+  }
   return 0;
 }
 
@@ -271,6 +357,7 @@ ngtcp2_callbacks callbacks = {
   .get_new_connection_id = get_new_connection_id_cb,
   .recv_stream_data = recv_stream_data_cb,
   .remove_connection_id = remove_connection_id,
+  .stream_close = stream_close_cb,
 };
 
 ngtcp2_conn*
@@ -363,7 +450,8 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
   gnutls_session_set_ptr (new_connection->session, &new_connection->conn_ref);
   new_connection->conn_ref.get_conn = get_conn;
   new_connection->conn_ref.user_data = new_connection;
-  new_connection->stream.stream_id = -1;
+  // new_connection->stream.stream_id = -1;
+  new_connection->streams = NULL;
   new_connection->server = s;
 
   return new_connection;
@@ -372,7 +460,6 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
 
 void
 connection_close (struct connection *connection);
-
 
 
 void
@@ -532,7 +619,7 @@ server_send_pkt (struct connection *connection,
 
 
 int
-write_to_stream (struct connection *connection)
+write_to_stream (struct connection *connection, struct Stream *stream)
 {
   uint8_t buf[1280];
   ngtcp2_tstamp ts = timestamp ();
@@ -550,15 +637,13 @@ write_to_stream (struct connection *connection)
 
   for (;;)
   {
-    if (-1 != connection->stream.stream_id &&
-        connection->stream.nwrite < connection->stream.datalen)
+    if (NULL != stream &&
+        stream->sent_offset < stream->datalen)
     {
-      stream_id = connection->stream.stream_id;
-      fin = 0;
-      datav.base = (uint8_t *) connection->stream.data
-                   + connection->stream.nwrite;
-      datav.len = connection->stream.datalen
-                  - connection->stream.nwrite;
+      stream_id = stream->stream_id;
+      fin = 1;
+      datav.base = (uint8_t *) stream->data + stream->sent_offset;
+      datav.len = stream->datalen - stream->sent_offset;
       datavcnt = 1;
     }
     else
@@ -569,6 +654,25 @@ write_to_stream (struct connection *connection)
       datav.len = 0;
       datavcnt = 0;
     }
+    // if (-1 != connection->stream.stream_id &&
+    //     connection->stream.nwrite < connection->stream.datalen)
+    // {
+    //   stream_id = connection->stream.stream_id;
+    //   fin = 0;
+    //   datav.base = (uint8_t *) connection->stream.data
+    //                + connection->stream.nwrite;
+    //   datav.len = connection->stream.datalen
+    //               - connection->stream.nwrite;
+    //   datavcnt = 1;
+    // }
+    // else
+    // {
+    //   stream_id = -1;
+    //   fin = 0;
+    //   datav.base = NULL;
+    //   datav.len = 0;
+    //   datavcnt = 0;
+    // }
 
     flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
     if (fin)
@@ -583,7 +687,8 @@ write_to_stream (struct connection *connection)
       switch (nwrite)
       {
       case NGTCP2_ERR_WRITE_MORE:
-        connection->stream.nwrite += (size_t) wdatalen;
+        // connection->stream.nwrite += (size_t) wdatalen;
+        stream->sent_offset += (size_t) wdatalen;
         continue;
       default:
         fprintf (stderr, "ngtcp2_conn_writev_stream: %s\n",
@@ -599,7 +704,8 @@ write_to_stream (struct connection *connection)
     }
     if (wdatalen > 0)
     {
-      connection->stream.nwrite += (size_t) wdatalen;
+      // connection->stream.nwrite += (size_t) wdatalen;
+      stream->sent_offset += (size_t) wdatalen;
     }
     if (0 != server_send_pkt (connection, buf, (size_t) nwrite,
                               &connection->client_addr,
@@ -616,10 +722,28 @@ connection_write (struct connection *connection)
   printf ("in connection_write!\n");
   ngtcp2_tstamp expiry, now;
   ev_tstamp t;
-  if (0 != write_to_stream (connection))
+  int rv;
+  struct Stream *stream = connection->streams;
+  if (NULL == stream)
   {
-    return -1;
+    rv = write_to_stream (connection, NULL);
+    if (0 != rv)
+    {
+      return -1;
+    }
   }
+  for (; stream; stream = stream->next)
+  {
+    rv = write_to_stream (connection, stream);
+    if (0 != rv)
+    {
+      return -1;
+    }
+  }
+  // if (0 != write_to_stream (connection))
+  // {
+  //   return -1;
+  // }
   expiry = ngtcp2_conn_get_expiry (connection->conn);
   now = timestamp ();
 
@@ -753,6 +877,7 @@ connection_free (struct connection *c)
 {
   if (NULL == c)
     return;
+  stream_free (c);
   if (c->session)
     gnutls_deinit (c->session);
   if (c->conn)
