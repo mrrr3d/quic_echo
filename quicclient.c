@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <string.h>
@@ -170,7 +171,7 @@ stdin_cb (struct ev_loop *loop, ev_io *w, int revents)
   nread = read (0, buf, sizeof(buf));
 
   ngtcp2_conn_open_bidi_stream (c->conn, &stream->stream_id, NULL);
-  stream->data = buf;
+  stream->data = (uint8_t *) buf;
   stream->datalen = nread;
 
   // if (c->stream.stream_id == -1)

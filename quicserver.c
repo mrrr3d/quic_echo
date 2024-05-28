@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <string.h>
@@ -90,7 +91,7 @@ dispaddr (struct sockaddr *addr, uint8_t *prestr)
 }
 
 
-int
+void
 server_gnutls_init (struct server *s)
 {
   s->cred = NULL;
@@ -276,12 +277,12 @@ recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   memcpy (buf + 10, data, datalen);
   buf[10 + datalen] = 0;
   write (1, buf, 10 + datalen);
-
+  return 0;
   memcpy (buf, data, datalen);
   char suffix[] = "-----server_side\n";
   memcpy (buf + datalen, suffix, sizeof (suffix));
   stream = create_stream (c, stream_id);
-  stream->data = buf;
+  stream->data = (uint8_t *) buf;
   stream->datalen = datalen + sizeof (suffix);
   stream->sent_offset = 0;
   // c->stream.data = buf;
@@ -325,7 +326,7 @@ stream_close_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                  uint64_t app_error_code, void *user_data,
                  void *stream_user_data)
 {
-  printf ("stream_close id = %ld\n", stream_id);
+  printf ("stream_close id = %ld, err_code = %lu\n", stream_id, app_error_code);
   struct connection *c = user_data;
   connection_remove_stream (c, stream_id);
   if (ngtcp2_is_bidi_stream (stream_id))
@@ -388,7 +389,7 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
   }
   struct connection *new_connection;
   new_connection = (struct connection*) malloc (sizeof (struct connection));
-  memset (new_connection, 0, sizeof(new_connection));
+  memset (new_connection, 0, sizeof (struct connection));
   new_connection->next = s->connections;
   s->connections = new_connection;
 
@@ -540,7 +541,7 @@ handle_incoming (struct server *s)
       fprintf (stderr, "recv_pkt error!\n");
       return -1;
     }
-    dispaddr ((struct sockaddr*) &remote_addr, "client");
+    dispaddr ((struct sockaddr*) &remote_addr, (uint8_t *) "client");
 
     ngtcp2_version_cid version_cid;
 
@@ -788,6 +789,7 @@ connection_close (struct connection *connection)
                    &connection->client_addr, connection->client_addrlen);
 fin:
   // ev_break (EV_DEFAULT, EVBREAK_ALL);
+  return;
 }
 
 
