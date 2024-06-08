@@ -50,6 +50,8 @@ struct connection
   struct connection *next;
 
   struct Stream *streams;
+  uint8_t conn_close_buf[1280];
+  ngtcp2_ssize conn_close_buflen;
 };
 
 struct server
@@ -63,6 +65,16 @@ struct server
   ngtcp2_settings settings;
   ev_io rev;
 
+};
+
+enum network_error
+{
+  NETWORK_ERR_OK = 0,
+  NETWORK_ERR_FATAL = -10,
+  NETWORK_ERR_SEND_BLOCKED = -11,
+  NETWORK_ERR_CLOSE_WAIT = -12,
+  NETWORK_ERR_RETRY = -13,
+  NETWORK_ERR_DROP_CONN = -14,
 };
 
 void
@@ -167,6 +179,124 @@ dispcid (const uint8_t *cid, size_t cidlen)
     printf ("%x", cid[i]);
   }
   printf ("\n");
+}
+
+
+void
+close_waitcb (struct ev_loop *loop, ev_timer *w, int revents)
+{
+
+}
+
+
+void
+start_draining_period (struct connection *c)
+{
+  ev_set_cb (&c->timer, close_waitcb);
+  c->timer.repeat = (ev_tstamp)
+                    (ngtcp2_conn_get_pto (c->conn))
+                    / NGTCP2_SECONDS * 3;
+  ev_timer_again (EV_DEFAULT, &c->timer);
+
+  printf ("start draining!\n");
+}
+
+
+int
+start_closing_period (struct connection *c)
+{
+  if (NULL == c->conn ||
+      ngtcp2_conn_in_closing_period (c->conn) ||
+      ngtcp2_conn_in_draining_period (c->conn))
+  {
+    return 0;
+  }
+
+  ev_set_cb (&c->timer, close_waitcb);
+  c->timer.repeat = (ev_tstamp)
+                    (ngtcp2_conn_get_pto (c->conn))
+                    / NGTCP2_SECONDS * 3;
+  ev_timer_again (EV_DEFAULT, &c->timer);
+
+  printf ("start closing!\n");
+
+  ngtcp2_path_storage ps;
+  ngtcp2_pkt_info pi;
+  ngtcp2_ssize nwrite;
+
+  ngtcp2_path_storage_zero (&ps);
+  nwrite = ngtcp2_conn_write_connection_close (c->conn,
+                                               &ps.path,
+                                               &pi,
+                                               c->conn_close_buf,
+                                               sizeof (c->conn_close_buf),
+                                               &c->last_error,
+                                               timestamp ());
+  if (nwrite < 0)
+  {
+    printf ("ngtcp2_conn_write_connection_close: %s\n",
+            ngtcp2_strerror (nwrite));
+    return -1;
+  }
+  if (0 == nwrite)
+  {
+    return 0;
+  }
+  c->conn_close_buflen = nwrite;
+  return 0;
+}
+
+
+int
+server_send_pkt (struct connection *connection,
+                 uint8_t *data, size_t datalen,
+                 struct sockaddr *remote_addr,
+                 socklen_t remotea_addrlen);
+
+
+int
+send_conn_close (struct connection *c)
+{
+  int rv;
+  /**
+   * TODO: we use ngtcp2_conn_get_path may be better.
+   */
+  printf ("closing period, send CONNECTION_CLOSE\n");
+  rv = server_send_pkt (c,
+                        c->conn_close_buf,
+                        c->conn_close_buflen,
+                        &c->client_addr,
+                        c->client_addrlen);
+  return rv;
+}
+
+
+int
+handle_error (struct connection *c)
+{
+  int rv;
+  if (NGTCP2_CCERR_TYPE_IDLE_CLOSE == c->last_error.type)
+  {
+    return -1;
+  }
+
+  if (0 != start_closing_period (c))
+  {
+    return -1;
+  }
+
+  if (ngtcp2_conn_in_draining_period (c->conn))
+  {
+    return NETWORK_ERR_CLOSE_WAIT;
+  }
+
+  rv = send_conn_close (c);
+  if (NETWORK_ERR_OK != rv)
+  {
+    return rv;
+  }
+
+  return NETWORK_ERR_CLOSE_WAIT;
 }
 
 
@@ -277,7 +407,6 @@ recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   memcpy (buf + 10, data, datalen);
   buf[10 + datalen] = 0;
   write (1, buf, 10 + datalen);
-  return 0;
   memcpy (buf, data, datalen);
   char suffix[] = "-----server_side\n";
   memcpy (buf + datalen, suffix, sizeof (suffix));
@@ -509,14 +638,14 @@ timer_cb (struct ev_loop *loop, ev_timer *w, int revents)
   {
     printf ("ngtcp2_conn_handle_expiry ret = %s\n", ngtcp2_strerror (ret));
     // connection_close (c);
-    server_remove_connection (c);
+    // server_remove_connection (c);
     return;
   }
   if (connection_write (c) != 0)
   {
     // fprintf (stdout, "client_write!=0\n");
     // connection_close (c);
-    server_remove_connection (c);
+    // server_remove_connection (c);
   }
 }
 
