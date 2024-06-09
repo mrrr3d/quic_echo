@@ -130,6 +130,60 @@ client_close (struct client *c);
 int
 client_write (struct client *c);
 
+int
+client_send_pkt (struct client *c, unsigned char *data, size_t datalen);
+
+
+int
+handle_error (struct client *c)
+{
+  uint8_t buf[1200];
+  ngtcp2_path_storage ps;
+  ngtcp2_pkt_info pi;
+  ngtcp2_ssize nwrite;
+  int rv;
+
+  if (! c->conn ||
+      ngtcp2_conn_in_closing_period (c->conn) ||
+      ngtcp2_conn_in_draining_period (c->conn))
+  {
+    return 0;
+  }
+
+  ngtcp2_path_storage_zero (&ps);
+  nwrite = ngtcp2_conn_write_connection_close (c->conn,
+                                               &ps.path,
+                                               &pi,
+                                               buf,
+                                               1200,
+                                               &c->last_error,
+                                               timestamp ());
+  if (nwrite < 0)
+  {
+    fprintf (stderr, "ngtcp2_conn_write_connection_close: %s\n",
+             ngtcp2_strerror (nwrite));
+    return -1;
+  }
+  if (0 == nwrite)
+  {
+    return 0;
+  }
+  rv = client_send_pkt (c, buf, nwrite);
+  return rv;
+}
+
+
+void
+client_disconnect (struct client*c)
+{
+  handle_error (c);
+
+  ev_timer_stop (EV_DEFAULT, &c->timer);
+  ev_io_stop (EV_DEFAULT, &c->rev);
+  ev_io_stop (EV_DEFAULT, &c->input);
+}
+
+
 struct Stream*
 create_stream (struct client *c, int64_t id)
 {
@@ -257,7 +311,7 @@ stream_close_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   connection_remove_stream (c, stream_id);
   int i = 0;
   struct Stream *s;
-  for (s = c->streams;s;s = s->next)
+  for (s = c->streams; s; s = s->next)
   {
     i += 1;
   }
@@ -420,6 +474,7 @@ client_read (struct client *c)
           ngtcp2_ccerr_set_liberr (&c->last_error, ret, NULL, 0);
         }
       }
+      client_disconnect (c);
       return -1;
     }
 
@@ -486,10 +541,12 @@ client_write_streams (struct client *c, struct Stream *stream)
     if (fin)
       flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
 
-    printf ("data_left: %lu\n",
-            ngtcp2_conn_get_max_stream_data_left (c->conn, stream_id));
-    printf ("stream_bidi_left: %lu\n",
-            ngtcp2_conn_get_streams_bidi_left (c->conn));
+    // printf ("data_left: %lu\n",
+    //         ngtcp2_conn_get_max_stream_data_left (c->conn, stream_id));
+    // printf ("stream_bidi_left: %lu\n",
+    //         ngtcp2_conn_get_streams_bidi_left (c->conn));
+    // printf ("connection_data_left: %lu\n",
+    //         ngtcp2_conn_get_max_data_left (c->conn));
     nwrite = ngtcp2_conn_writev_stream (c->conn, &ps.path, &pi, buf,
                                         sizeof(buf),
                                         &wdatalen, flags, stream_id, &datav,
@@ -499,16 +556,38 @@ client_write_streams (struct client *c, struct Stream *stream)
     {
       switch (nwrite)
       {
+      case NGTCP2_ERR_STREAM_DATA_BLOCKED:
+        // add nghttp3 block stream
+        continue;
+      case NGTCP2_ERR_STREAM_SHUT_WR:
+        // add nghttp3 shutdown stream write
+        continue;
       case NGTCP2_ERR_WRITE_MORE:
-        // c->stream.nwrite += (size_t) wdatalen;
+        // nghttp3 write offset
+        // ngtcp2 set application error
         stream->sent_offset += (size_t) wdatalen;
         continue;
-      default:
-        fprintf (stderr, "ngtcp2_conn_writev_stream: %s\n",
-                 ngtcp2_strerror ((int) nwrite));
-        ngtcp2_ccerr_set_liberr (&c->last_error, (int) nwrite, NULL, 0);
-        return -1;
       }
+      // switch (nwrite)
+      // {
+      // case NGTCP2_ERR_WRITE_MORE:
+      //   // c->stream.nwrite += (size_t) wdatalen;
+      //   stream->sent_offset += (size_t) wdatalen;
+      //   continue;
+      // default:
+      //   fprintf (stderr, "ngtcp2_conn_writev_stream: %s\n",
+      //            ngtcp2_strerror ((int) nwrite));
+      //   ngtcp2_ccerr_set_liberr (&c->last_error, (int) nwrite, NULL, 0);
+      //   return -1;
+      // }
+      printf ("ngtcp2_conn_writev_stream: %s\n",
+              ngtcp2_strerror (nwrite));
+      ngtcp2_ccerr_set_liberr (&c->last_error,
+                               nwrite,
+                               NULL,
+                               0);
+      client_disconnect (c);
+      return -1;
     }
     if (nwrite == 0)
     {
@@ -618,22 +697,44 @@ read_cb (struct ev_loop *loop, ev_io *w, int revents)
 }
 
 
+int
+handle_expiry (struct client *c)
+{
+  ngtcp2_tstamp now;
+  int rv;
+
+  now = timestamp ();
+  rv = ngtcp2_conn_handle_expiry (c->conn, now);
+  if (0 != rv)
+  {
+    fprintf (stderr, "ngtcp2_conn_handle_expiry: %s\n",
+             ngtcp2_strerror (rv));
+    ngtcp2_ccerr_set_liberr (&c->last_error, rv, NULL, 0);
+    client_disconnect (c);
+    return -1;
+  }
+  return 0;
+}
+
+
 void
 timer_cb (struct ev_loop *loop, ev_timer *w, int revents)
 {
   // fprintf (stdout, "timer_cb\n");
   struct client *c = w->data;
+  int rv;
 
-  if (ngtcp2_conn_handle_expiry (c->conn, timestamp ()) != 0)
+  rv = handle_expiry (c);
+  if (0 != rv)
   {
     // fprintf (stdout, "ngtcp2_conn_handle_expiry!=0\n");
-    client_close (c);
+    // client_close (c);
     return;
   }
   if (client_write (c) != 0)
   {
     // fprintf (stdout, "client_write!=0\n");
-    client_close (c);
+    // client_close (c);
   }
 }
 
@@ -700,6 +801,7 @@ client_free (struct client *c)
   ngtcp2_conn_del (c->conn);
   gnutls_deinit (c->session);
   gnutls_certificate_free_credentials (c->cred);
+  client_disconnect (c);
 }
 
 

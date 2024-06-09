@@ -274,6 +274,7 @@ send_conn_close (struct connection *c)
 int
 handle_error (struct connection *c)
 {
+  printf ("handle_error called\n");
   int rv;
   if (NGTCP2_CCERR_TYPE_IDLE_CLOSE == c->last_error.type)
   {
@@ -605,6 +606,7 @@ server_remove_connection (struct connection *connection)
     s->connections = connection->next;
     ev_timer_stop (EV_DEFAULT, &connection->timer);
     ev_io_stop (EV_DEFAULT, &connection->wev);
+    ngtcp2_conn_del (connection->conn);
     free (connection);
     return;
   }
@@ -619,10 +621,30 @@ server_remove_connection (struct connection *connection)
     curr->next = connection->next;
     ev_timer_stop (EV_DEFAULT, &connection->timer);
     ev_io_stop (EV_DEFAULT, &connection->wev);
+    ngtcp2_conn_del (connection->conn);
     free (connection);
   }
 
   return;
+}
+
+
+int
+handle_expiry (struct connection *c)
+{
+  ngtcp2_tstamp now;
+  int rv;
+
+  now = timestamp ();
+  rv = ngtcp2_conn_handle_expiry (c->conn, now);
+  if (0 != rv)
+  {
+    printf ("ngtcp2_conn_handle_expiry: %s\n",
+            ngtcp2_strerror (rv));
+    ngtcp2_ccerr_set_liberr (&c->last_error, rv, NULL, 0);
+    return handle_error (c);
+  }
+  return 0;
 }
 
 
@@ -632,20 +654,32 @@ timer_cb (struct ev_loop *loop, ev_timer *w, int revents)
 
   printf ("=====in timer_cb\n");
   struct connection *c = w->data;
-
-  int ret = ngtcp2_conn_handle_expiry (c->conn, timestamp ());
-  if (ret != 0)
+  int ret;
+  ret = handle_expiry (c);
+  if (0 != ret)
   {
-    printf ("ngtcp2_conn_handle_expiry ret = %s\n", ngtcp2_strerror (ret));
-    // connection_close (c);
-    // server_remove_connection (c);
-    return;
+    switch (ret)
+    {
+    case NETWORK_ERR_CLOSE_WAIT:
+      ev_timer_stop (EV_DEFAULT, w);
+      return;
+    default:
+      server_remove_connection (c);
+      return;
+    }
   }
-  if (connection_write (c) != 0)
+  ret = connection_write (c);
+  if (0 != ret)
   {
-    // fprintf (stdout, "client_write!=0\n");
-    // connection_close (c);
-    // server_remove_connection (c);
+    switch (ret)
+    {
+    case NETWORK_ERR_CLOSE_WAIT:
+      ev_timer_stop (EV_DEFAULT, w);
+      return;
+    default:
+      server_remove_connection (c);
+      return;
+    }
   }
 }
 
@@ -713,9 +747,35 @@ handle_incoming (struct server *s)
                                 buf, n_read, timestamp ());
     if (ret < 0)
     {
-      fprintf (stderr, "ret = %d, ngtcp2_conn_read_pkt: %s\n", ret,
-               ngtcp2_strerror (ret));
-      return -1;
+      switch (ret)
+      {
+      case NGTCP2_ERR_DRAINING:
+        start_draining_period (connection);
+        return NETWORK_ERR_CLOSE_WAIT;
+      case NGTCP2_ERR_RETRY:
+        return NETWORK_ERR_RETRY;
+      case NGTCP2_ERR_DROP_CONN:
+        return NETWORK_ERR_DROP_CONN;
+      case NGTCP2_ERR_CRYPTO:
+        if (! connection->last_error.error_code)
+        {
+          ngtcp2_ccerr_set_tls_alert (&connection->last_error,
+                                      ngtcp2_conn_get_tls_alert (
+                                        connection->conn),
+                                      NULL,
+                                      0);
+        }
+        break;
+      default:
+        if (! connection->last_error.error_code)
+        {
+          ngtcp2_ccerr_set_liberr (&connection->last_error,
+                                   ret,
+                                   NULL,
+                                   0);
+        }
+      }
+      return handle_error (connection);
     }
     return 0;
   }
@@ -784,25 +844,6 @@ write_to_stream (struct connection *connection, struct Stream *stream)
       datav.len = 0;
       datavcnt = 0;
     }
-    // if (-1 != connection->stream.stream_id &&
-    //     connection->stream.nwrite < connection->stream.datalen)
-    // {
-    //   stream_id = connection->stream.stream_id;
-    //   fin = 0;
-    //   datav.base = (uint8_t *) connection->stream.data
-    //                + connection->stream.nwrite;
-    //   datav.len = connection->stream.datalen
-    //               - connection->stream.nwrite;
-    //   datavcnt = 1;
-    // }
-    // else
-    // {
-    //   stream_id = -1;
-    //   fin = 0;
-    //   datav.base = NULL;
-    //   datav.len = 0;
-    //   datavcnt = 0;
-    // }
 
     flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
     if (fin)
@@ -816,17 +857,25 @@ write_to_stream (struct connection *connection, struct Stream *stream)
     {
       switch (nwrite)
       {
+      case NGTCP2_ERR_STREAM_DATA_BLOCKED:
+        // add nghttp3 block stream
+        continue;
+      case NGTCP2_ERR_STREAM_SHUT_WR:
+        // add nghttp3 shutdown stream write
+        continue;
       case NGTCP2_ERR_WRITE_MORE:
-        // connection->stream.nwrite += (size_t) wdatalen;
+        // nghttp3 write offset
+        // ngtcp2 set application error
         stream->sent_offset += (size_t) wdatalen;
         continue;
-      default:
-        fprintf (stderr, "ngtcp2_conn_writev_stream: %s\n",
-                 ngtcp2_strerror ((int) nwrite));
-        ngtcp2_ccerr_set_liberr (&connection->last_error, (int) nwrite, NULL, 0)
-        ;
-        return -1;
       }
+      printf ("ngtcp2_conn_writev_stream: %s\n",
+              ngtcp2_strerror (nwrite));
+      ngtcp2_ccerr_set_liberr (&connection->last_error,
+                               nwrite,
+                               NULL,
+                               0);
+      return handle_error (connection);
     }
     if (nwrite == 0)
     {
@@ -854,6 +903,11 @@ connection_write (struct connection *connection)
   ev_tstamp t;
   int rv;
   struct Stream *stream = connection->streams;
+  if (ngtcp2_conn_in_closing_period (connection->conn) ||
+      ngtcp2_conn_in_draining_period (connection->conn))
+  {
+    return 0;
+  }
   if (NULL == stream)
   {
     rv = write_to_stream (connection, NULL);
