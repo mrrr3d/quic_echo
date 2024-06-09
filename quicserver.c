@@ -183,9 +183,25 @@ dispcid (const uint8_t *cid, size_t cidlen)
 
 
 void
+server_remove_connection (struct connection *connection);
+
+void
 close_waitcb (struct ev_loop *loop, ev_timer *w, int revents)
 {
+  struct connection *c = w->data;
 
+  if (ngtcp2_conn_in_closing_period (c->conn))
+  {
+    printf ("closing period over\n");
+    server_remove_connection (c);
+    return;
+  }
+  if (ngtcp2_conn_in_draining_period (c->conn))
+  {
+    printf ("draining period over\n");
+    server_remove_connection (c);
+    return;
+  }
 }
 
 
