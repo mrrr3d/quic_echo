@@ -174,7 +174,7 @@ handle_error (struct client *c)
 
 
 void
-client_disconnect (struct client*c)
+client_disconnect (struct client *c)
 {
   handle_error (c);
 
@@ -425,7 +425,43 @@ client_send_pkt (struct client *c, unsigned char *data, size_t datalen)
 
 
 int
-client_read (struct client *c)
+feed_data (struct client *c, struct sockaddr *sa, socklen_t salen,
+           const ngtcp2_pkt_info *pi, const uint8_t *data, size_t datalen)
+{
+  ngtcp2_path path;
+  int rv;
+
+  path.local.addr = &c->client_addr;
+  path.local.addrlen = c->client_addrlen;
+  path.remote.addr = sa;
+  path.remote.addrlen = salen;
+
+  rv = ngtcp2_conn_read_pkt (c->conn, &path, pi, data, datalen, timestamp ());
+  if (0 != rv)
+  {
+    fprintf (stderr, "ngtcp2_conn_read_pkt: %s\n",
+             ngtcp2_strerror (rv));
+    if (! c->last_error.error_code)
+    {
+      if (NGTCP2_ERR_CRYPTO == rv)
+      {
+        ngtcp2_ccerr_set_tls_alert (
+          &c->last_error, ngtcp2_conn_get_tls_alert (c->conn), NULL, 0);
+      }
+      else
+      {
+        ngtcp2_ccerr_set_liberr (&c->last_error, rv, NULL, 0);
+      }
+    }
+    client_disconnect (c);
+    return -1;
+  }
+  return 0;
+}
+
+
+int
+on_read (struct client *c)
 {
   struct msghdr msg = {0};
   struct sockaddr_storage addr;
@@ -452,33 +488,16 @@ client_read (struct client *c)
       break;
     }
 
-    path.local.addr = &c->client_addr;
-    path.local.addrlen = c->client_addrlen;
-    path.remote.addr = msg.msg_name;
-    path.remote.addrlen = msg.msg_namelen;
-
     int ret;
-    ret = ngtcp2_conn_read_pkt (c->conn, &path, &pi, buf, nread, timestamp ());
-    if (ret != 0)
+    ret = feed_data (c, (struct sockaddr *) msg.msg_name, msg.msg_namelen, &pi,
+                     buf, nread);
+    if (0 != ret)
     {
-      fprintf (stderr, "ngtcp2_conn_read_pkt: %s\n", ngtcp2_strerror (ret));
-      if (! c->last_error.error_code)
-      {
-        if (ret == NGTCP2_ERR_CRYPTO)
-        {
-          ngtcp2_ccerr_set_tls_alert (
-            &c->last_error, ngtcp2_conn_get_tls_alert (c->conn), NULL, 0);
-        }
-        else
-        {
-          ngtcp2_ccerr_set_liberr (&c->last_error, ret, NULL, 0);
-        }
-      }
-      client_disconnect (c);
       return -1;
     }
 
   }
+  // TODO: update_timer here.
   return 0;
 }
 
@@ -683,10 +702,11 @@ read_cb (struct ev_loop *loop, ev_io *w, int revents)
 {
   // fprintf (stdout, "read_cb\n");
   struct client *c = w->data;
-  if (client_read (c) != 0)
+  int rv;
+
+  rv = on_read (c);
+  if (0 != rv)
   {
-    // fprintf (stdout, "client_read!=0\n");
-    client_close (c);
     return;
   }
   if (client_write (c) != 0)
