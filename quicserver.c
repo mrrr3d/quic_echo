@@ -1,9 +1,13 @@
+#include <bits/types/struct_iovec.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 #include <ev.h>
 
@@ -700,6 +704,289 @@ timer_cb (struct ev_loop *loop, ev_timer *w, int revents)
 }
 
 
+struct connection *
+connection_init (struct server *s,
+                 const struct sockaddr *sa, socklen_t salen,
+                 const ngtcp2_cid *dcid, const ngtcp2_cid *scid,
+                 uint32_t version)
+{
+  struct connection *new_connection;
+  ngtcp2_path path;
+  ngtcp2_transport_params params;
+  ngtcp2_cid scid_;
+  ngtcp2_conn *conn = NULL;
+  int rv;
+
+  new_connection = (struct connection *) malloc (sizeof(struct connection));
+  memset (new_connection, 0, sizeof(struct connection));
+  new_connection->next = s->connections;
+  s->connections = new_connection;
+  s->num_connections += 1;
+
+  gnutls_init (&new_connection->session,
+               GNUTLS_SERVER
+               | GNUTLS_ENABLE_EARLY_DATA
+               | GNUTLS_NO_END_OF_EARLY_DATA);
+  gnutls_priority_set_direct (new_connection->session, PRIO, NULL);
+  gnutls_credentials_set (new_connection->session,
+                          GNUTLS_CRD_CERTIFICATE,
+                          s->cred);
+  new_connection->fd = s->fd;
+
+  path.local.addr = (struct sockaddr *) &s->local_addr;
+  path.local.addrlen = s->local_addrlen;
+  path.remote.addr = (struct sockaddr*) sa;
+  path.remote.addrlen = salen;
+
+  ngtcp2_transport_params_default (&params);
+  params.initial_max_streams_uni = 3;
+  params.initial_max_streams_bidi = 3;
+  params.initial_max_stream_data_bidi_local = 128 * 1024;
+  params.initial_max_stream_data_bidi_remote = 128 * 1024;
+  params.initial_max_data = 1024 * 1024;
+  params.original_dcid_present = 1;
+  params.max_idle_timeout = 30 * NGTCP2_SECONDS;
+  params.original_dcid = *scid;
+
+  get_random_cid (&scid_);
+
+  rv = ngtcp2_conn_server_new (&conn,
+                               dcid,
+                               &scid_,
+                               &path,
+                               version,
+                               &callbacks,
+                               &s->settings,
+                               &params,
+                               NULL, new_connection);
+  if (rv < 0)
+  {
+    fprintf (stderr, "ngtcp2_conn_server_new error!\n");
+    return NULL;
+  }
+
+  new_connection->conn = conn;
+  memcpy (&new_connection->local_addr, &s->local_addr, s->local_addrlen);
+  new_connection->local_addrlen = s->local_addrlen;
+
+  memcpy (&new_connection->client_addr, sa, salen);
+  new_connection->client_addrlen = salen;
+
+  ngtcp2_crypto_gnutls_configure_server_session (new_connection->session);
+  ngtcp2_conn_set_tls_native_handle (new_connection->conn,
+                                     new_connection->session);
+  gnutls_session_set_ptr (new_connection->session, &new_connection->conn_ref);
+  new_connection->conn_ref.get_conn = get_conn;
+  new_connection->conn_ref.user_data = new_connection;
+  new_connection->streams = NULL;
+  new_connection->server = s;
+
+  ev_io_init (&new_connection->wev, write_cb, new_connection->fd, EV_WRITE);
+  new_connection->wev.data = s;
+  ev_timer_init (&new_connection->timer, timer_cb, 0., 0.);
+  new_connection->timer.data = new_connection;
+
+  return new_connection;
+}
+
+
+int
+connection_feed_data (struct connection *c, struct sockaddr *sa,
+                      socklen_t salen, const ngtcp2_pkt_info *pi,
+                      const uint8_t *data, size_t datalen)
+{
+  ngtcp2_path path;
+  int rv;
+
+  path.local.addr = &c->local_addr;
+  path.local.addrlen = c->local_addrlen;
+  path.remote.addr = sa;
+  path.remote.addrlen = salen;
+
+  rv = ngtcp2_conn_read_pkt (c->conn, &path, pi, data, datalen, timestamp ());
+  if (0 != rv)
+  {
+    fprintf (stderr, "ngtcp2_conn_read_pkt: %s\n", ngtcp2_strerror (rv));
+    switch (rv)
+    {
+    case NGTCP2_ERR_DRAINING:
+      start_draining_period (c);
+      return NETWORK_ERR_CLOSE_WAIT;
+    case NGTCP2_ERR_RETRY:
+      return NETWORK_ERR_RETRY;
+    case NGTCP2_ERR_DROP_CONN:
+      return NETWORK_ERR_DROP_CONN;
+    case NGTCP2_ERR_CRYPTO:
+      if (! c->last_error.error_code)
+      {
+        ngtcp2_ccerr_set_tls_alert (
+          &c->last_error, ngtcp2_conn_get_tls_alert (c->conn), NULL, 0);
+      }
+      break;
+    default:
+      if (! c->last_error.error_code)
+      {
+        ngtcp2_ccerr_set_liberr (&c->last_error, rv, NULL, 0);
+      }
+    }
+    return handle_error (c);
+  }
+  return 0;
+}
+
+
+int
+connection_on_read (struct connection *c, struct sockaddr *sa,
+                    socklen_t salen, const ngtcp2_pkt_info *pi,
+                    const uint8_t *data, size_t datalen)
+{
+  int rv;
+  rv = connection_feed_data (c, sa, salen, pi, data, datalen);
+  if (0 != rv)
+  {
+    return rv;
+  }
+
+  // update_timer here.
+  return 0;
+}
+
+
+void
+server_read_pkt (struct server *s,
+                 struct sockaddr *remote_addr, socklen_t remote_addrlen,
+                 const ngtcp2_pkt_info *pi,
+                 const uint8_t *data, size_t datalen)
+{
+  ngtcp2_version_cid version_cid;
+  struct connection *connection;
+  int rv;
+
+  rv = ngtcp2_pkt_decode_version_cid (&version_cid, data, datalen,
+                                      NGTCP2_MAX_CIDLEN);
+  switch (rv)
+  {
+  case 0:
+    break;
+  case NGTCP2_ERR_VERSION_NEGOTIATION:
+    // TODO: send version negotiation.
+    return;
+  default:
+    fprintf (stderr, "can't decode version and CID: %s",
+             ngtcp2_strerror (rv));
+    return;
+  }
+
+  connection = find_connection (s, version_cid.dcid, version_cid.dcidlen);
+  if (NULL == connection)
+  {
+    ngtcp2_pkt_hd header;
+    rv = ngtcp2_accept (&header, data, datalen);
+    if (0 != rv)
+    {
+      fprintf (stderr, "ngtcp2_accept: %s",
+               ngtcp2_strerror (rv));
+      return;
+    }
+
+
+    // TODO: handle the stateless reset token.
+
+    connection = connection_init (s, remote_addr, remote_addrlen, &header.scid,
+                                  &header.dcid, header.version);
+    if (NULL == connection)
+    {
+      return;
+    }
+
+    rv = connection_on_read (connection, remote_addr, remote_addrlen, pi, data,
+                             datalen);
+    switch (rv)
+    {
+    case 0:
+      break;
+    case NETWORK_ERR_RETRY:
+      // send retry
+      return;
+    default:
+      return;
+    }
+
+    rv = connection_write (connection);
+    if (0 != rv)
+    {
+      return;
+    }
+
+    // deal with cid map
+
+    return;
+  }
+
+  if (ngtcp2_conn_in_closing_period (connection->conn))
+  {
+    rv = send_conn_close (connection);
+    if (0 != rv)
+    {
+      server_remove_connection (connection);
+    }
+    return;
+  }
+  if (ngtcp2_conn_in_draining_period (connection->conn))
+  {
+    return;
+  }
+
+  rv = connection_on_read (connection, remote_addr, remote_addrlen, pi, data,
+                           datalen);
+  if (0 != rv)
+  {
+    if (rv != NETWORK_ERR_CLOSE_WAIT)
+    {
+      server_remove_connection (connection);
+    }
+    return;
+  }
+
+  connection_write (connection);
+}
+
+
+int
+server_on_read (struct server *s)
+{
+  struct sockaddr_storage addr;
+  socklen_t addrlen;
+  uint8_t buf[65535];
+  ssize_t n_read;
+  ngtcp2_pkt_info pi;
+  struct iovec iov = {buf, sizeof (buf)};
+  struct msghdr msg = {0};
+  int rv;
+
+  msg.msg_name = &addr;
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  for (;;)
+  {
+    msg.msg_namelen = sizeof (addr);
+    n_read = recvmsg (s->fd, &msg, 0);
+    if (-1 == n_read)
+    {
+      if (errno != EAGAIN && errno != EWOULDBLOCK)
+      {
+        fprintf (stderr, "recvmsg: %s\n", strerror (errno));
+      }
+      return 0;
+    }
+
+    server_read_pkt (s, msg.msg_name, msg.msg_namelen, &pi, buf, n_read);
+  }
+
+  return 0;
+}
+
+
 int
 handle_incoming (struct server *s)
 {
@@ -998,7 +1285,8 @@ read_cb (struct ev_loop *loop, ev_io *w, int revents)
   struct server *s = w->data;
   int ret;
   printf ("num_connections = %d\n", s->num_connections);
-  ret = handle_incoming (s);
+  // ret = handle_incoming (s);
+  ret = server_on_read (s);
   if (0 != ret)
   {
     printf ("handle_incoming error!\n");
