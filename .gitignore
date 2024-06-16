@@ -1,5 +1,7 @@
 quicclient
 quicserver
+h3client
+h3server
 # Prerequisites
 *.d
 
