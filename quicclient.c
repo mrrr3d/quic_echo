@@ -460,6 +460,30 @@ feed_data (struct client *c, struct sockaddr *sa, socklen_t salen,
 }
 
 
+void
+update_timer (struct client *c)
+{
+  ngtcp2_tstamp expiry;
+  ngtcp2_tstamp now;
+  ev_tstamp t;
+
+  expiry = ngtcp2_conn_get_expiry (c->conn);
+  now = timestamp ();
+  if (expiry <= now)
+  {
+    t = (ev_tstamp) (now - expiry) / NGTCP2_SECONDS;
+    fprintf (stderr, "Timer expired: %lfs\n", t);
+
+    ev_feed_event (EV_DEFAULT, &c->timer, EV_TIMER);
+    return;
+  }
+  t = (ev_tstamp) (expiry - now) / NGTCP2_SECONDS;
+  fprintf (stderr, "Set timer = %lfs\n", t);
+  c->timer.repeat = t;
+  ev_timer_again (EV_DEFAULT, &c->timer);
+}
+
+
 int
 on_read (struct client *c)
 {
@@ -498,6 +522,7 @@ on_read (struct client *c)
 
   }
   // TODO: update_timer here.
+  update_timer (c);
   return 0;
 }
 
@@ -652,14 +677,7 @@ client_write (struct client *c)
   // {
   //   return -1;
   // }
-  expiry = ngtcp2_conn_get_expiry (c->conn);
-  now = timestamp ();
-
-  t = expiry < now ? 1e-9 : (ev_tstamp) (expiry - now) / NGTCP2_SECONDS;
-
-  // printf("t=%lf\n", t);
-  c->timer.repeat = t;
-  ev_timer_again (EV_DEFAULT, &c->timer);
+  update_timer (c);
 
   return 0;
 }

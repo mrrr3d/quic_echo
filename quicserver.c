@@ -835,6 +835,30 @@ connection_feed_data (struct connection *c, struct sockaddr *sa,
 }
 
 
+void
+update_timer (struct connection *c)
+{
+  ngtcp2_tstamp expiry;
+  ngtcp2_tstamp now;
+  ev_tstamp t;
+
+  expiry = ngtcp2_conn_get_expiry (c->conn);
+  now = timestamp ();
+  if (expiry <= now)
+  {
+    t = (ev_tstamp) (now - expiry) / NGTCP2_SECONDS;
+    fprintf (stderr, "Timer expired: %lfs\n", t);
+
+    ev_feed_event (EV_DEFAULT, &c->timer, EV_TIMER);
+    return;
+  }
+  t = (ev_tstamp) (expiry - now) / NGTCP2_SECONDS;
+  fprintf (stderr, "Set timer = %lfs\n", t);
+  c->timer.repeat = t;
+  ev_timer_again (EV_DEFAULT, &c->timer);
+}
+
+
 int
 connection_on_read (struct connection *c, struct sockaddr *sa,
                     socklen_t salen, const ngtcp2_pkt_info *pi,
@@ -848,6 +872,7 @@ connection_on_read (struct connection *c, struct sockaddr *sa,
   }
 
   // update_timer here.
+  update_timer (c);
   return 0;
 }
 
@@ -1231,14 +1256,7 @@ connection_write (struct connection *connection)
   // {
   //   return -1;
   // }
-  expiry = ngtcp2_conn_get_expiry (connection->conn);
-  now = timestamp ();
-
-  t = expiry < now ? 1e-9 : (ev_tstamp) (expiry - now) / NGTCP2_SECONDS;
-
-  // printf("t=%lf\n", t);
-  connection->timer.repeat = t;
-  ev_timer_again (EV_DEFAULT, &connection->timer);
+  update_timer (connection);
 
   return 0;
 }
