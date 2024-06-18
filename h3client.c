@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
 #include <unistd.h>
 #include <ev.h>
 
@@ -466,12 +467,29 @@ recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                      void *stream_user_data)
 {
 
-  ngtcp2_conn_extend_max_stream_offset (conn, stream_id, datalen);
-  ngtcp2_conn_extend_max_offset (conn, datalen);
-  char buf[256] = "recv_data:";
-  memcpy (buf + 10, data, datalen);
-  buf[10 + datalen] = 0;
-  write (1, buf, 10 + datalen);
+  // ngtcp2_conn_extend_max_stream_offset (conn, stream_id, datalen);
+  // ngtcp2_conn_extend_max_offset (conn, datalen);
+  // char buf[256] = "recv_data:";
+  // memcpy (buf + 10, data, datalen);
+  // buf[10 + datalen] = 0;
+  // write (1, buf, 10 + datalen);
+
+  nghttp3_ssize nconsumed;
+  struct client *c = user_data;
+
+  nconsumed = nghttp3_conn_read_stream (c->h3conn, stream_id, data, datalen,
+                                        flags & NGTCP2_STREAM_DATA_FLAG_FIN);
+  if (nconsumed < 0)
+  {
+    fprintf (stderr, "nghttp3_conn_read_stream: %s\n",
+             nghttp3_strerror (nconsumed));
+    ngtcp2_ccerr_set_application_error (
+      &c->last_error,
+      nghttp3_err_infer_quic_app_error_code (nconsumed), NULL, 0);
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+
+  http_consume (c, stream_id, nconsumed);
 
   return 0;
 }
@@ -505,20 +523,151 @@ connection_remove_stream (struct client *c, int64_t stream_id)
 
 
 int
+extend_max_stream_data_cb (ngtcp2_conn *conn, int64_t stream_id,
+                           uint64_t max_data, void *user_data,
+                           void *stream_user_data)
+{
+  struct client *c = user_data;
+  int rv;
+
+  rv = nghttp3_conn_unblock_stream (c->h3conn, stream_id);
+  if (0 != rv)
+  {
+    fprintf (stderr, "nghttp3_conn_unblock_stream: %s\n",
+             nghttp3_strerror (rv));
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+  return 0;
+}
+
+
+int
+stream_reset_cb (ngtcp2_conn *conn, int64_t stream_id, uint64_t final_size,
+                 uint64_t app_error_code, void *user_data,
+                 void *stream_user_data)
+{
+  struct client *c = user_data;
+  int rv;
+
+  if (c->h3conn)
+  {
+    rv = nghttp3_conn_shutdown_stream_read (c->h3conn, stream_id);
+    if (0 != rv)
+    {
+      fprintf (stderr, "nghttp3_conn_shutdown_stream_read: %s\n",
+               nghttp3_strerror (rv));
+      return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+  }
+  return 0;
+}
+
+
+int
+stream_stop_sending_cb (ngtcp2_conn *conn, int64_t stream_id,
+                        uint64_t app_error_code, void *user_data,
+                        void *stream_user_data)
+{
+  struct client *c = user_data;
+  int rv;
+
+  if (c->h3conn)
+  {
+    rv = nghttp3_conn_shutdown_stream_read (c->h3conn, stream_id);
+    if (0 != rv)
+    {
+      fprintf (stderr, "nghttp3_conn_shutdown_stream_read: %s\n",
+               nghttp3_strerror (rv));
+      return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+  }
+  return 0;
+}
+
+
+int
+acked_stream_data_offset_cb (ngtcp2_conn *conn, int64_t stream_id,
+                             uint64_t offset, uint64_t datalen, void *user_data,
+                             void *stream_user_data)
+{
+  struct client *c = user_data;
+  int rv;
+
+  rv = nghttp3_conn_add_ack_offset (c->h3conn, stream_id, datalen);
+  if (0 != rv)
+  {
+    fprintf (stderr, "nghttp3_conn_add_ack_offset: %s\n",
+             nghttp3_strerror (rv));
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+  return 0;
+}
+
+
+int
+client_on_stream_close (struct client *c, int64_t stream_id,
+                        uint64_t app_error_code)
+{
+  int rv;
+
+  if (c->h3conn)
+  {
+    if (0 == app_error_code)
+    {
+      app_error_code = NGHTTP3_H3_NO_ERROR;
+    }
+    rv = nghttp3_conn_close_stream (c->h3conn, stream_id, app_error_code);
+    switch (rv)
+    {
+    case 0:
+      break;
+    case NGHTTP3_ERR_STREAM_NOT_FOUND:
+      if (! ngtcp2_is_bidi_stream (stream_id))
+      {
+        ngtcp2_conn_extend_max_streams_uni (c->conn, 1);
+      }
+      break;
+    default:
+      fprintf (stderr, "nghttp3_conn_close_stream: %s\n",
+               nghttp3_strerror (rv));
+      ngtcp2_ccerr_set_application_error (
+        &c->last_error,
+        nghttp3_err_infer_quic_app_error_code (rv),
+        NULL, 0);
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+
+int
 stream_close_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                  uint64_t app_error_code, void *user_data,
                  void *stream_user_data)
 {
   printf ("stream_close id = %ld\n", stream_id);
   struct client *c = user_data;
-  connection_remove_stream (c, stream_id);
-  int i = 0;
-  struct Stream *s;
-  for (s = c->streams; s; s = s->next)
+  int rv;
+
+  // connection_remove_stream (c, stream_id);
+  // int i = 0;
+  // struct Stream *s;
+  // for (s = c->streams; s; s = s->next)
+  // {
+  //   i += 1;
+  // }
+  // printf ("streams cnt = %d\n", i);
+  if (! (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET))
   {
-    i += 1;
+    app_error_code = NGHTTP3_H3_NO_ERROR;
   }
-  printf ("streams cnt = %d\n", i);
+  rv = client_on_stream_close (c, stream_id, app_error_code);
+  if (0 != rv)
+  {
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
   return 0;
 }
 
@@ -560,13 +709,16 @@ client_quic_init (struct client *c, struct sockaddr *client_addr,
     .get_path_challenge_data = ngtcp2_crypto_get_path_challenge_data_cb,
     .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
 
-    // .acked_stream_data_offset = acked_stream_data_offset_cb,
+    .acked_stream_data_offset = acked_stream_data_offset_cb,
     .recv_stream_data = recv_stream_data_cb,
     .rand = rand_cb,
     .get_new_connection_id = get_new_connection_id_cb,
     .handshake_completed = handshake_completed_cb,
     .stream_close = stream_close_cb,
     // .extend_max_local_streams_bidi = extend_max_local_streams_bidi,
+    .extend_max_stream_data = extend_max_stream_data_cb,
+    .stream_reset = stream_reset_cb,
+    .stream_stop_sending = stream_stop_sending_cb,
   };
 
   ngtcp2_cid dcid, scid;
