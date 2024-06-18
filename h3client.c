@@ -10,6 +10,7 @@
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_gnutls.h>
+#include <nghttp3/nghttp3.h>
 
 #include <gnutls/crypto.h>
 #include <gnutls/gnutls.h>
@@ -54,6 +55,7 @@ struct client
   socklen_t client_addrlen;
   ngtcp2_crypto_conn_ref conn_ref;
   ngtcp2_conn *conn;
+  nghttp3_conn *h3conn;
   struct Stream *streams;
 
   ngtcp2_ccerr last_error;
@@ -133,6 +135,8 @@ client_write (struct client *c);
 int
 client_send_pkt (struct client *c, unsigned char *data, size_t datalen);
 
+void
+connection_remove_stream (struct client *c, int64_t stream_id);
 
 int
 handle_error (struct client *c)
@@ -211,6 +215,23 @@ stream_free (struct client *c)
 }
 
 
+struct Stream*
+find_stream (struct client *c, int64_t stream_id)
+{
+  struct Stream *curr;
+  curr = c->streams;
+  while (NULL != curr)
+  {
+    if (curr->stream_id == stream_id)
+    {
+      return curr;
+    }
+    curr = curr->next;
+  }
+  return NULL;
+}
+
+
 void
 stdin_cb (struct ev_loop *loop, ev_io *w, int revents)
 {
@@ -241,6 +262,188 @@ stdin_cb (struct ev_loop *loop, ev_io *w, int revents)
   client_write (c);
 
   return;
+}
+
+
+void
+http_consume (struct client *c, int64_t stream_id, size_t consumed)
+{
+  ngtcp2_conn_extend_max_stream_offset (c->conn, stream_id, consumed);
+  ngtcp2_conn_extend_max_offset (c->conn, consumed);
+}
+
+
+int
+http_stream_close (nghttp3_conn *conn, int64_t stream_id,
+                   uint64_t app_error_code, void *conn_user_data,
+                   void *stream_user_data)
+{
+  struct client *c = conn_user_data;
+
+  if (! ngtcp2_is_bidi_stream (stream_id))
+  {
+    ngtcp2_conn_extend_max_streams_uni (c->conn, 1);
+  }
+  else
+  {
+    // increase closed stream cnt
+  }
+
+  if (NULL != find_stream (c, stream_id))
+  {
+    connection_remove_stream (c, stream_id);
+  }
+
+  return 0;
+}
+
+
+int
+http_recv_data (nghttp3_conn *conn, int64_t stream_id, const uint8_t *data,
+                size_t datalen, void *user_data, void *stream_user_data)
+{
+  fprintf (stdout, "http_recv_data");
+  struct client *c = user_data;
+  http_consume (c, stream_id, datalen);
+  // write data to file.
+
+  return 0;
+}
+
+
+int
+http_deferred_consume (nghttp3_conn *conn, int64_t stream_id,
+                       size_t nconsumed, void *user_data,
+                       void *stream_user_data)
+{
+  struct client *c = user_data;
+  http_consume (c, stream_id, nconsumed);
+
+  return 0;
+}
+
+
+int
+http_stop_sending (nghttp3_conn *conn, int64_t stream_id,
+                   uint64_t app_error_code, void *user_data,
+                   void *stream_user_data)
+{
+  struct client *c = user_data;
+  int rv;
+
+  rv = ngtcp2_conn_shutdown_stream_read (c->conn, 0, stream_id, app_error_code);
+  if (0 != rv)
+  {
+    fprintf (stderr, "ngtcp2_conn_shutdown_stream_read: %s\n",
+             ngtcp2_strerror (rv));
+    return NGHTTP3_ERR_CALLBACK_FAILURE;
+  }
+  return 0;
+}
+
+
+int
+http_reset_stream (nghttp3_conn *conn, int64_t stream_id,
+                   uint64_t app_error_code, void *user_data,
+                   void *stream_user_data)
+{
+  struct client *c = user_data;
+  int rv;
+
+  rv = ngtcp2_conn_shutdown_stream_write (c->conn, 0, stream_id,
+                                          app_error_code);
+  if (0 != rv)
+  {
+    fprintf (stderr, "ngtcp2_conn_shutdown_stream_write: %s\n",
+             ngtcp2_strerror (rv));
+    return NGHTTP3_ERR_CALLBACK_FAILURE;
+  }
+  return 0;
+}
+
+
+int
+setup_httpconn (struct client *c)
+{
+  if (NULL != c->h3conn)
+  {
+    return 0;
+  }
+
+  if (ngtcp2_conn_get_streams_uni_left (c->conn) < 3)
+  {
+    fprintf (stderr, "uni stream left less than 3!\n");
+    return -1;
+  }
+
+  nghttp3_callbacks callbacks = {
+    .stream_close = http_stream_close,
+    .recv_data = http_recv_data,
+    .deferred_consume = http_deferred_consume,
+    .stop_sending = http_stop_sending,
+    .reset_stream = http_reset_stream,
+  };
+  nghttp3_settings settings;
+  const nghttp3_mem *mem;
+  int64_t ctrl_stream_id;
+  int64_t enc_stream_id;
+  int64_t dec_stream_id;
+  int rv;
+
+  nghttp3_settings_default (&settings);
+  settings.qpack_max_dtable_capacity = 4096;
+  settings.qpack_blocked_streams = 100;
+
+  mem = nghttp3_mem_default ();
+
+  rv = nghttp3_conn_client_new (&c->h3conn, &callbacks, &settings, mem, c);
+  if (0 != rv)
+  {
+    fprintf (stderr, "nghttp3_conn_client_new: %s\n", nghttp3_strerror (rv));
+    return -1;
+  }
+
+  rv = ngtcp2_conn_open_uni_stream (c->conn, &ctrl_stream_id, NULL);
+  if (0 != rv)
+  {
+    fprintf (stderr, "ngtcp2_conn_open_uni_stream: %s\n", ngtcp2_strerror (rv));
+    return -1;
+  }
+
+  rv = nghttp3_conn_bind_control_stream (c->h3conn, ctrl_stream_id);
+  if (0 != rv)
+  {
+    fprintf (stderr, "nghttp3_conn_bind_control_stream: %s\n",
+             nghttp3_strerror (rv));
+    return -1;
+  }
+
+  rv = ngtcp2_conn_open_uni_stream (c->conn, &enc_stream_id, NULL);
+  if (0 != rv)
+  {
+    fprintf (stderr, "ngtcp2_conn_open_uni_stream: %s\n", ngtcp2_strerror (rv));
+    return -1;
+  }
+
+  rv = ngtcp2_conn_open_uni_stream (c->conn, &dec_stream_id, NULL);
+  if (0 != rv)
+  {
+    fprintf (stderr, "ngtcp2_conn_open_uni_stream: %s\n", ngtcp2_strerror (rv));
+    return -1;
+  }
+
+  rv = nghttp3_conn_bind_qpack_streams (c->h3conn,
+                                        enc_stream_id, dec_stream_id);
+  if (0 != rv)
+  {
+    fprintf (stderr, "nghttp3_conn_bind_qpack_streams: %s\n",
+             nghttp3_strerror (rv));
+    return -1;
+  }
+
+  fprintf (stdout, "ctrl stream: %ld, enc stream: %ld, dec stream: %ld\n",
+           ctrl_stream_id, enc_stream_id, dec_stream_id);
+  return 0;
 }
 
 
@@ -837,6 +1040,7 @@ client_free (struct client *c)
 {
   stream_free (c);
   ngtcp2_conn_del (c->conn);
+  nghttp3_conn_del (c->h3conn);
   gnutls_deinit (c->session);
   gnutls_certificate_free_credentials (c->cred);
   client_disconnect (c);
