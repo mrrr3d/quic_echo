@@ -250,7 +250,7 @@ stdin_cb (struct ev_loop *loop, ev_io *w, int revents)
   stream->data = (uint8_t *) buf;
   stream->datalen = nread;
 
-  
+
   client_write (c);
 
   return;
@@ -917,7 +917,7 @@ client_write_streams (struct client *c, struct Stream *stream)
         stream->sent_offset += (size_t) wdatalen;
         continue;
       }
-      
+
       printf ("ngtcp2_conn_writev_stream: %s\n",
               ngtcp2_strerror (nwrite));
       ngtcp2_ccerr_set_liberr (&c->last_error,
@@ -934,6 +934,167 @@ client_write_streams (struct client *c, struct Stream *stream)
     if (wdatalen > 0)
     {
       stream->sent_offset += (size_t) wdatalen;
+    }
+    if (client_send_pkt (c, buf, (size_t) nwrite) != 0)
+      break;
+  }
+  return 0;
+}
+
+
+nghttp3_nv
+make_nv (const uint8_t *name, size_t namelen,
+         const uint8_t *value, size_t valuelen,
+         uint8_t flags)
+{
+  nghttp3_nv nv = {
+    name, value, namelen, valuelen, flags
+  };
+  return nv;
+}
+
+
+int
+client_submit_requests (struct client *c, int64_t stream_id)
+{
+  nghttp3_nv nva[6] = {
+    make_nv ((const uint8_t *) ":method", sizeof (":method"),
+             (const uint8_t *) "GET", sizeof ("GET"),
+             NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
+    make_nv ((const uint8_t *) ":scheme", sizeof (":scheme"),
+             (const uint8_t *) "https", sizeof ("https"),
+             NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
+    make_nv ((const uint8_t *) ":authority", sizeof (":authority"),
+             (const uint8_t *) "127.0.0.1:5556", sizeof ("127.0.0.1:5556"),
+             NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
+    make_nv ((const uint8_t *) ":path", sizeof (":path"),
+             (const uint8_t *) "/", sizeof ("/"),
+             NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
+    make_nv ((const uint8_t *) "user-agent", sizeof ("user-agent"),
+             (const uint8_t *) "nghttp3/ngtcp2 client",
+             sizeof ("nghttp3/ngtcp2 client"),
+             NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
+  };
+  int rv;
+
+  rv = nghttp3_conn_submit_request (c->h3conn, stream_id, nva, 5, NULL, NULL);
+  if (0 != rv)
+  {
+    fprintf (stderr, "nghttp3_conn_submit_request: %s\n",
+             nghttp3_strerror (rv));
+    return -1;
+  }
+
+  return 0;
+}
+
+
+int
+client_write_streams2 (struct client *c, struct Stream *stream)
+{
+  uint8_t buf[1280];
+  ngtcp2_tstamp ts = timestamp ();
+  ngtcp2_path_storage ps;
+  int64_t stream_id;
+  uint32_t flags;
+  ngtcp2_ssize nwrite;
+  ngtcp2_ssize wdatalen;
+  ngtcp2_pkt_info pi;
+  nghttp3_vec vec[16];
+  nghttp3_ssize sveccnt;
+  int fin;
+  int rv;
+
+  ngtcp2_path_storage_zero (&ps);
+
+  for (;;)
+  {
+    stream_id = -1;
+    fin = 0;
+    sveccnt = 0;
+    if (c->h3conn && ngtcp2_conn_get_max_data_left (c->conn))
+    {
+      sveccnt = nghttp3_conn_writev_stream (c->h3conn,
+                                            &stream_id, &fin, vec, 16);
+      if (sveccnt < 0)
+      {
+        fprintf (stderr, "nghttp3_conn_writev_stream: %s\n",
+                 nghttp3_strerror (sveccnt));
+        ngtcp2_ccerr_set_application_error (
+          &c->last_error,
+          nghttp3_err_infer_quic_app_error_code (sveccnt),
+          NULL, 0);
+        client_disconnect (c);
+        return -1;
+      }
+    }
+
+    flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
+    if (fin)
+      flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+
+    nwrite = ngtcp2_conn_writev_stream (c->conn, &ps.path, &pi, buf,
+                                        sizeof(buf),
+                                        &wdatalen, flags, stream_id,
+                                        (ngtcp2_vec *) vec,
+                                        (size_t) sveccnt, ts);
+
+    if (nwrite < 0)
+    {
+      switch (nwrite)
+      {
+      case NGTCP2_ERR_STREAM_DATA_BLOCKED:
+        nghttp3_conn_block_stream (c->h3conn, stream_id);
+        continue;
+      case NGTCP2_ERR_STREAM_SHUT_WR:
+        nghttp3_conn_shutdown_stream_write (c->h3conn, stream_id);
+        continue;
+      case NGTCP2_ERR_WRITE_MORE:
+        // nghttp3 write offset
+        // ngtcp2 set application error
+        stream->sent_offset += (size_t) wdatalen;
+        rv = nghttp3_conn_add_write_offset (c->h3conn, stream_id, wdatalen);
+        if (0 != rv)
+        {
+          fprintf (stderr, "nghttp3_conn_add_write_offset: %s\n",
+                   nghttp3_strerror (rv));
+          ngtcp2_ccerr_set_application_error (
+            &c->last_error, nghttp3_err_infer_quic_app_error_code (rv),
+            NULL, 0);
+          client_disconnect (c);
+          return -1;
+        }
+        continue;
+      }
+
+      printf ("ngtcp2_conn_writev_stream: %s\n",
+              ngtcp2_strerror (nwrite));
+      ngtcp2_ccerr_set_liberr (&c->last_error,
+                               nwrite,
+                               NULL,
+                               0);
+      client_disconnect (c);
+      return -1;
+    }
+    if (nwrite == 0)
+    {
+      return 0;
+    }
+    if (wdatalen > 0)
+    {
+      // stream->sent_offset += (size_t) wdatalen;
+      rv = nghttp3_conn_add_write_offset (c->h3conn, stream_id, wdatalen);
+      if (0 != rv)
+      {
+        fprintf (stderr, "nghttp3_conn_add_write_offset: %s\n",
+                 nghttp3_strerror (rv));
+        ngtcp2_ccerr_set_application_error (
+          &c->last_error,
+          nghttp3_err_infer_quic_app_error_code (rv),
+          NULL, 0);
+        client_disconnect (c);
+        return -1;
+      }
     }
     if (client_send_pkt (c, buf, (size_t) nwrite) != 0)
       break;
@@ -965,7 +1126,7 @@ client_write (struct client *c)
       return -1;
     }
   }
-  
+
   update_timer (c);
 
   return 0;
