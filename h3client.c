@@ -19,7 +19,8 @@
 
 #define REMOTE_HOST "127.0.0.1"
 #define REMOTE_PORT "5556"
-#define ALPN "hq-interop"
+#define ALPN "h3"
+// #define ALPN "hq-interop"
 
 uint64_t
 timestamp (void)
@@ -74,6 +75,10 @@ static const char priority[] =
 int
 client_gnutls_init (struct client *c)
 {
+  const gnutls_datum_t alpn = {
+    (uint8_t *) ALPN,
+    sizeof (ALPN) - 1
+  };
   gnutls_certificate_allocate_credentials (&c->cred);
   gnutls_certificate_set_x509_system_trust (c->cred);
   gnutls_init (&c->session, GNUTLS_CLIENT | GNUTLS_ENABLE_EARLY_DATA
@@ -86,6 +91,7 @@ client_gnutls_init (struct client *c)
   gnutls_session_set_ptr (c->session, &c->conn_ref);
   gnutls_credentials_set (c->session, GNUTLS_CRD_CERTIFICATE, c->cred);
 
+  gnutls_alpn_set_protocols (c->session, &alpn, 1, GNUTLS_ALPN_MANDATORY);
   gnutls_server_name_set (c->session, GNUTLS_NAME_DNS,
                           "localhost", strlen ("localhost"));
   return 0;
@@ -294,7 +300,7 @@ int
 http_recv_data (nghttp3_conn *conn, int64_t stream_id, const uint8_t *data,
                 size_t datalen, void *user_data, void *stream_user_data)
 {
-  fprintf (stdout, "http_recv_data");
+  fprintf (stdout, "http_recv_data\n");
   struct client *c = user_data;
   http_consume (c, stream_id, datalen);
   // write data to file.
@@ -440,6 +446,10 @@ setup_httpconn (struct client *c)
 
 
 int
+client_submit_requests (struct client *c, int64_t stream_id);
+
+
+int
 handshake_completed_cb (ngtcp2_conn *conn, void *user_data)
 {
   printf ("=====handshake_ok!=====\n");
@@ -447,6 +457,19 @@ handshake_completed_cb (ngtcp2_conn *conn, void *user_data)
   ev_io_init (&c->input, stdin_cb, 0, EV_READ);
   c->input.data = c;
   ev_io_start (EV_DEFAULT, &c->input);
+  if (0 != setup_httpconn (c))
+  {
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+
+  int rv;
+  int64_t stream_id;
+  struct Stream *stream;
+
+  stream = create_stream (c, -1);
+  ngtcp2_conn_open_bidi_stream (c->conn, &stream->stream_id, NULL);
+  client_submit_requests (c, stream->stream_id);
+
   return 0;
 }
 
@@ -958,21 +981,21 @@ int
 client_submit_requests (struct client *c, int64_t stream_id)
 {
   nghttp3_nv nva[6] = {
-    make_nv ((const uint8_t *) ":method", sizeof (":method"),
-             (const uint8_t *) "GET", sizeof ("GET"),
+    make_nv ((const uint8_t *) ":method", sizeof (":method") - 1,
+             (const uint8_t *) "GET", sizeof ("GET") - 1,
              NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
-    make_nv ((const uint8_t *) ":scheme", sizeof (":scheme"),
-             (const uint8_t *) "https", sizeof ("https"),
+    make_nv ((const uint8_t *) ":scheme", sizeof (":scheme") - 1,
+             (const uint8_t *) "https", sizeof ("https") - 1,
              NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
-    make_nv ((const uint8_t *) ":authority", sizeof (":authority"),
-             (const uint8_t *) "127.0.0.1:5556", sizeof ("127.0.0.1:5556"),
+    make_nv ((const uint8_t *) ":authority", sizeof (":authority") - 1,
+             (const uint8_t *) "127.0.0.1:5556", sizeof ("127.0.0.1:5556") - 1,
              NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
-    make_nv ((const uint8_t *) ":path", sizeof (":path"),
-             (const uint8_t *) "/", sizeof ("/"),
+    make_nv ((const uint8_t *) ":path", sizeof (":path") - 1,
+             (const uint8_t *) "/", sizeof ("/") - 1,
              NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
-    make_nv ((const uint8_t *) "user-agent", sizeof ("user-agent"),
+    make_nv ((const uint8_t *) "user-agent", sizeof ("user-agent") - 1,
              (const uint8_t *) "nghttp3/ngtcp2 client",
-             sizeof ("nghttp3/ngtcp2 client"),
+             sizeof ("nghttp3/ngtcp2 client") - 1,
              NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
   };
   int rv;
@@ -1052,7 +1075,7 @@ client_write_streams2 (struct client *c, struct Stream *stream)
       case NGTCP2_ERR_WRITE_MORE:
         // nghttp3 write offset
         // ngtcp2 set application error
-        stream->sent_offset += (size_t) wdatalen;
+        // stream->sent_offset += (size_t) wdatalen;
         rv = nghttp3_conn_add_write_offset (c->h3conn, stream_id, wdatalen);
         if (0 != rv)
         {
@@ -1112,7 +1135,7 @@ client_write (struct client *c)
   struct Stream *stream = c->streams;
   if (NULL == stream)
   {
-    rv = client_write_streams (c, NULL);
+    rv = client_write_streams2 (c, NULL);
     if (0 != rv)
     {
       return -1;
@@ -1120,7 +1143,7 @@ client_write (struct client *c)
   }
   for (; stream; stream = stream->next)
   {
-    rv = client_write_streams (c, stream);
+    rv = client_write_streams2 (c, stream);
     if (0 != rv)
     {
       return -1;
