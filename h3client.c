@@ -59,6 +59,8 @@ struct client
   ngtcp2_conn *conn;
   nghttp3_conn *h3conn;
   struct Stream *streams;
+  size_t nstreams_done_;
+  size_t nstreams_;
 
   ngtcp2_ccerr last_error;
   ev_timer timer;
@@ -302,6 +304,7 @@ http_recv_data (nghttp3_conn *conn, int64_t stream_id, const uint8_t *data,
 {
   fprintf (stdout, "http_recv_data\n");
   struct client *c = user_data;
+  printf ("%s\n", data);
   http_consume (c, stream_id, datalen);
   // write data to file.
 
@@ -382,7 +385,7 @@ setup_httpconn (struct client *c)
     .reset_stream = http_reset_stream,
   };
   nghttp3_settings settings;
-  const nghttp3_mem *mem;
+  const nghttp3_mem *mem = nghttp3_mem_default ();
   int64_t ctrl_stream_id;
   int64_t enc_stream_id;
   int64_t dec_stream_id;
@@ -391,8 +394,6 @@ setup_httpconn (struct client *c)
   nghttp3_settings_default (&settings);
   settings.qpack_max_dtable_capacity = 4096;
   settings.qpack_blocked_streams = 100;
-
-  mem = nghttp3_mem_default ();
 
   rv = nghttp3_conn_client_new (&c->h3conn, &callbacks, &settings, mem, c);
   if (0 != rv)
@@ -453,6 +454,7 @@ int
 handshake_completed_cb (ngtcp2_conn *conn, void *user_data)
 {
   printf ("=====handshake_ok!=====\n");
+  return 0;
   struct client *c = user_data;
   ev_io_init (&c->input, stdin_cb, 0, EV_READ);
   c->input.data = c;
@@ -475,6 +477,44 @@ handshake_completed_cb (ngtcp2_conn *conn, void *user_data)
 
 
 int
+extend_max_local_streams_bidi_cb (ngtcp2_conn *conn, uint64_t max_streams,
+                                  void *user_data)
+{
+  struct client *c = user_data;
+  struct Stream *stream;
+
+  for (; c->nstreams_done_ < c->nstreams_; c->nstreams_done_ += 1)
+  {
+    stream = create_stream (c, -1);
+    ngtcp2_conn_open_bidi_stream (c->conn, &stream->stream_id, NULL);
+    client_submit_requests (c, stream->stream_id);
+  }
+  return 0;
+}
+
+
+int
+recv_rx_key_cb (ngtcp2_conn *conn, ngtcp2_encryption_level level,
+                void *user_data)
+{
+  if (NGTCP2_ENCRYPTION_LEVEL_1RTT != level)
+  {
+    return 0;
+  }
+
+  struct client *c = user_data;
+  int rv;
+
+  rv = setup_httpconn (c);
+  if (0 != rv)
+  {
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+  return 0;
+}
+
+
+int
 recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                      uint64_t offset, const uint8_t *data, size_t datalen,
                      void *user_data,
@@ -485,6 +525,8 @@ recv_stream_data_cb (ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
 
   nconsumed = nghttp3_conn_read_stream (c->h3conn, stream_id, data, datalen,
                                         flags & NGTCP2_STREAM_DATA_FLAG_FIN);
+  printf ("recv_stream_data_cb: id = %ld, len = %lu, consumed = %ld\n",
+          stream_id, datalen, nconsumed);
   if (nconsumed < 0)
   {
     fprintf (stderr, "nghttp3_conn_read_stream: %s\n",
@@ -713,10 +755,11 @@ client_quic_init (struct client *c, struct sockaddr *client_addr,
     .get_new_connection_id = get_new_connection_id_cb,
     .handshake_completed = handshake_completed_cb,
     .stream_close = stream_close_cb,
-    // .extend_max_local_streams_bidi = extend_max_local_streams_bidi,
+    .extend_max_local_streams_bidi = extend_max_local_streams_bidi_cb,
     .extend_max_stream_data = extend_max_stream_data_cb,
     .stream_reset = stream_reset_cb,
     .stream_stop_sending = stream_stop_sending_cb,
+    .recv_rx_key = recv_rx_key_cb,
   };
 
   ngtcp2_cid dcid, scid;
@@ -735,9 +778,15 @@ client_quic_init (struct client *c, struct sockaddr *client_addr,
   // settings.log_printf = log_printf;
 
   ngtcp2_transport_params_default (&params);
-  params.initial_max_streams_uni = 3;
-  params.initial_max_stream_data_bidi_local = 128 * 1024;
-  params.initial_max_data = 1024 * 1024;
+  params.initial_max_streams_uni = 100;
+  params.initial_max_stream_data_bidi_local = 6291456;
+  params.initial_max_data = 15728640;
+  params.initial_max_stream_data_bidi_remote = 0;
+  params.initial_max_stream_data_uni = 6291456;
+  params.initial_max_streams_bidi = 0;
+  params.max_idle_timeout = 30 * NGTCP2_SECONDS;
+  params.active_connection_id_limit = 7;
+  params.grease_quic_bit = 1;
 
   ngtcp2_conn_client_new (&c->conn, &dcid, &scid, &path, NGTCP2_PROTO_VER_V1,
                           &callbacks, &settings, &params, NULL, c);
@@ -1286,6 +1335,8 @@ client_init (struct client *c)
 
   ev_timer_init (&c->timer, timer_cb, 0., 0.);
   c->timer.data = c;
+  c->nstreams_ = 1;
+  c->nstreams_done_ = 0;
 
   return 0;
 }
