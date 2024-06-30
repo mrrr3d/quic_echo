@@ -455,24 +455,6 @@ handshake_completed_cb (ngtcp2_conn *conn, void *user_data)
 {
   printf ("=====handshake_ok!=====\n");
   return 0;
-  struct client *c = user_data;
-  ev_io_init (&c->input, stdin_cb, 0, EV_READ);
-  c->input.data = c;
-  ev_io_start (EV_DEFAULT, &c->input);
-  if (0 != setup_httpconn (c))
-  {
-    return NGTCP2_ERR_CALLBACK_FAILURE;
-  }
-
-  int rv;
-  int64_t stream_id;
-  struct Stream *stream;
-
-  stream = create_stream (c, -1);
-  ngtcp2_conn_open_bidi_stream (c->conn, &stream->stream_id, NULL);
-  client_submit_requests (c, stream->stream_id);
-
-  return 0;
 }
 
 
@@ -927,93 +909,6 @@ on_read (struct client *c)
 }
 
 
-int
-client_write_streams (struct client *c, struct Stream *stream)
-{
-  uint8_t buf[1280];
-  ngtcp2_tstamp ts = timestamp ();
-  ngtcp2_path_storage ps;
-  int64_t stream_id;
-  uint32_t flags;
-  ngtcp2_vec datav;
-  size_t datavcnt;
-  ngtcp2_ssize nwrite;
-  ngtcp2_ssize wdatalen;
-  ngtcp2_pkt_info pi;
-  int fin;
-
-  ngtcp2_path_storage_zero (&ps);
-
-  for (;;)
-  {
-    if (NULL != stream &&
-        stream->sent_offset < stream->datalen)
-    {
-      stream_id = stream->stream_id;
-      fin = 1;
-      datav.base = (uint8_t *) stream->data + stream->sent_offset;
-      datav.len = stream->datalen - stream->sent_offset;
-      datavcnt = 1;
-    }
-    else
-    {
-      stream_id = -1;
-      fin = 0;
-      datav.base = NULL;
-      datav.len = 0;
-      datavcnt = 0;
-    }
-
-    flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
-    if (fin)
-      flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
-
-    nwrite = ngtcp2_conn_writev_stream (c->conn, &ps.path, &pi, buf,
-                                        sizeof(buf),
-                                        &wdatalen, flags, stream_id, &datav,
-                                        datavcnt, ts);
-
-    if (nwrite < 0)
-    {
-      switch (nwrite)
-      {
-      case NGTCP2_ERR_STREAM_DATA_BLOCKED:
-        // add nghttp3 block stream
-        continue;
-      case NGTCP2_ERR_STREAM_SHUT_WR:
-        // add nghttp3 shutdown stream write
-        continue;
-      case NGTCP2_ERR_WRITE_MORE:
-        // nghttp3 write offset
-        // ngtcp2 set application error
-        stream->sent_offset += (size_t) wdatalen;
-        continue;
-      }
-
-      printf ("ngtcp2_conn_writev_stream: %s\n",
-              ngtcp2_strerror (nwrite));
-      ngtcp2_ccerr_set_liberr (&c->last_error,
-                               nwrite,
-                               NULL,
-                               0);
-      client_disconnect (c);
-      return -1;
-    }
-    if (nwrite == 0)
-    {
-      return 0;
-    }
-    if (wdatalen > 0)
-    {
-      stream->sent_offset += (size_t) wdatalen;
-    }
-    if (client_send_pkt (c, buf, (size_t) nwrite) != 0)
-      break;
-  }
-  return 0;
-}
-
-
 nghttp3_nv
 make_nv (const uint8_t *name, size_t namelen,
          const uint8_t *value, size_t valuelen,
@@ -1062,7 +957,7 @@ client_submit_requests (struct client *c, int64_t stream_id)
 
 
 int
-client_write_streams2 (struct client *c, struct Stream *stream)
+client_write_streams (struct client *c, struct Stream *stream)
 {
   uint8_t buf[1280];
   ngtcp2_tstamp ts = timestamp ();
@@ -1184,7 +1079,7 @@ client_write (struct client *c)
   struct Stream *stream = c->streams;
   if (NULL == stream)
   {
-    rv = client_write_streams2 (c, NULL);
+    rv = client_write_streams (c, NULL);
     if (0 != rv)
     {
       return -1;
@@ -1192,7 +1087,7 @@ client_write (struct client *c)
   }
   for (; stream; stream = stream->next)
   {
-    rv = client_write_streams2 (c, stream);
+    rv = client_write_streams (c, stream);
     if (0 != rv)
     {
       return -1;
