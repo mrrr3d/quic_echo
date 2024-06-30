@@ -17,8 +17,10 @@
 #include <gnutls/gnutls.h>
 
 
-#define REMOTE_HOST "127.0.0.1"
-#define REMOTE_PORT "5556"
+// #define REMOTE_HOST "127.0.0.1"
+// #define REMOTE_PORT "5556"
+#define REMOTE_HOST "139.162.123.134"
+#define REMOTE_PORT "4433"
 #define ALPN "h3"
 // #define ALPN "hq-interop"
 
@@ -364,6 +366,21 @@ http_reset_stream (nghttp3_conn *conn, int64_t stream_id,
 
 
 int
+http_recv_header (nghttp3_conn *conn, int64_t stream_id, int32_t token,
+                  nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
+                  void *user_data, void *stream_user_data)
+{
+  nghttp3_vec namebuf = nghttp3_rcbuf_get_buf (name);
+  nghttp3_vec valbuf = nghttp3_rcbuf_get_buf (value);
+
+  fprintf (stdout, "http header: [%.*s: %.*s]\n",
+           (int) namebuf.len, namebuf.base, (int) valbuf.len, valbuf.base);
+
+  return 0;
+}
+
+
+int
 setup_httpconn (struct client *c)
 {
   if (NULL != c->h3conn)
@@ -383,6 +400,7 @@ setup_httpconn (struct client *c)
     .deferred_consume = http_deferred_consume,
     .stop_sending = http_stop_sending,
     .reset_stream = http_reset_stream,
+    .recv_header = http_recv_header,
   };
   nghttp3_settings settings;
   const nghttp3_mem *mem = nghttp3_mem_default ();
@@ -933,6 +951,7 @@ client_submit_requests (struct client *c, int64_t stream_id)
              NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
     make_nv ((const uint8_t *) ":authority", sizeof (":authority") - 1,
              (const uint8_t *) "127.0.0.1:5556", sizeof ("127.0.0.1:5556") - 1,
+             //  (const uint8_t *) "nghttp2.org", sizeof ("nghttp2.org") - 1,
              NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE),
     make_nv ((const uint8_t *) ":path", sizeof (":path") - 1,
              (const uint8_t *) "/", sizeof ("/") - 1,
