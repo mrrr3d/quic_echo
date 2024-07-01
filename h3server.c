@@ -147,6 +147,23 @@ stream_free (struct connection *c)
 }
 
 
+struct Stream*
+find_stream (struct connection *c, int64_t stream_id)
+{
+  struct Stream *curr;
+  curr = c->streams;
+  while (NULL != curr)
+  {
+    if (curr->stream_id == stream_id)
+    {
+      return curr;
+    }
+    curr = curr->next;
+  }
+  return NULL;
+}
+
+
 ssize_t
 recv_pkt (int fd, uint8_t *data, size_t datalen,
           struct sockaddr *remote_addr, socklen_t *remote_addrlen)
