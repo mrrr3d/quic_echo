@@ -17,10 +17,10 @@
 #include <gnutls/gnutls.h>
 
 
-// #define REMOTE_HOST "127.0.0.1"
-// #define REMOTE_PORT "5556"
-#define REMOTE_HOST "139.162.123.134"
-#define REMOTE_PORT "4433"
+#define REMOTE_HOST "127.0.0.1"
+#define REMOTE_PORT "5556"
+// #define REMOTE_HOST "139.162.123.134"
+// #define REMOTE_PORT "4433"
 #define ALPN "h3"
 // #define ALPN "hq-interop"
 
@@ -306,7 +306,11 @@ http_recv_data (nghttp3_conn *conn, int64_t stream_id, const uint8_t *data,
 {
   fprintf (stdout, "http_recv_data\n");
   struct client *c = user_data;
-  printf ("%s\n", data);
+  printf ("datalen = %lu\n", datalen);
+  char *str = (char *) malloc (datalen + 1);
+  memcpy (str, data, datalen);
+  str[datalen] = 0;
+  printf ("%s\n", str);
   http_consume (c, stream_id, datalen);
   // write data to file.
 
