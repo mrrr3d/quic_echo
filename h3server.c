@@ -151,18 +151,18 @@ create_stream (struct connection *c, int64_t id)
 void
 free_stream (struct Stream *stream)
 {
-  // if (stream->uri)
-  // {
-  //   free (stream->uri);
-  // }
-  // if (stream->method)
-  // {
-  //   free (stream->method);
-  // }
-  // if (stream->authority)
-  // {
-  //   free (stream->authority);
-  // }
+  if (stream->uri)
+  {
+    free (stream->uri);
+  }
+  if (stream->method)
+  {
+    free (stream->method);
+  }
+  if (stream->authority)
+  {
+    free (stream->authority);
+  }
   if (stream->status_resp_body)
   {
     free (stream->status_resp_body);
