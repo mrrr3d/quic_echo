@@ -1277,7 +1277,7 @@ accept_connection (struct server *s, struct sockaddr *remote_addr,
   ngtcp2_transport_params params;
   ngtcp2_transport_params_default (&params);
   params.initial_max_streams_uni = 3;
-  params.initial_max_streams_bidi = 3;
+  params.initial_max_streams_bidi = 100;
   params.initial_max_stream_data_bidi_local = 128 * 1024;
   params.initial_max_stream_data_bidi_remote = 128 * 1024;
   params.initial_max_data = 1024 * 1024;
@@ -2062,37 +2062,19 @@ int
 connection_write (struct connection *connection)
 {
   printf ("in connection_write!\n");
-  ngtcp2_tstamp expiry, now;
-  ev_tstamp t;
   int rv;
-  struct Stream *stream = connection->streams;
+
   if (ngtcp2_conn_in_closing_period (connection->conn) ||
       ngtcp2_conn_in_draining_period (connection->conn))
   {
     return 0;
   }
-  write_streams (connection);
-  update_timer (connection);
-  return 0;
-  if (NULL == stream)
+  rv = write_streams (connection);
+  if (0 != rv)
   {
-    rv = write_to_stream (connection, NULL);
-    if (0 != rv)
-    {
-      return -1;
-    }
+    return rv;
   }
-  for (; stream; stream = stream->next)
-  {
-    rv = write_to_stream (connection, stream);
-    if (0 != rv)
-    {
-      return -1;
-    }
-  }
-
   update_timer (connection);
-
   return 0;
 }
 

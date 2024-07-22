@@ -980,7 +980,7 @@ client_submit_requests (struct client *c, int64_t stream_id)
 
 
 int
-client_write_streams (struct client *c, struct Stream *stream)
+client_write_streams (struct client *c)
 {
   uint8_t buf[1280];
   ngtcp2_tstamp ts = timestamp ();
@@ -1096,25 +1096,12 @@ client_write_streams (struct client *c, struct Stream *stream)
 int
 client_write (struct client *c)
 {
-  ngtcp2_tstamp expiry, now;
-  ev_tstamp t;
   int rv;
-  struct Stream *stream = c->streams;
-  if (NULL == stream)
+
+  rv = client_write_streams (c);
+  if (0 != rv)
   {
-    rv = client_write_streams (c, NULL);
-    if (0 != rv)
-    {
-      return -1;
-    }
-  }
-  for (; stream; stream = stream->next)
-  {
-    rv = client_write_streams (c, stream);
-    if (0 != rv)
-    {
-      return -1;
-    }
+    return rv;
   }
 
   update_timer (c);
